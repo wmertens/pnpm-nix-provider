@@ -42,11 +42,17 @@ Request:
       "tarball": "https://registry.npmjs.org/foo/-/foo-1.2.3.tgz",
       "integrity": "sha512-…",                    // SRI, used verbatim as the fixed-output hash
       "deps": { "<alias>": { "depPath": "<other depPath>", "name": "bar" } },
-      "engine": "linux;x64;node22"                // optional platform key folded into the derivation
+      "engine": "linux;x64;node22",               // optional platform key folded into the derivation
+      "patch": { "content": "diff --git …", "hash": "…" } // optional git-style patch, applied after unpack
     }
   }
 }
 ```
+
+Patches are deterministic, so the patch content is simply another derivation
+input: a changed patch yields a new store path, an unchanged one hits the
+cache. Patches are applied with `git apply` inside the sandbox before
+dependency links are created and scripts run.
 
 `nodes` must be a closed graph: every `deps[].depPath` must itself be a key of
 `nodes`. Keys are opaque identifiers to the provider (pnpm uses depPaths, which
@@ -81,6 +87,8 @@ any further linking.
 
 - Only registry tarball resolutions (git/local-directory dependencies are
   rejected).
+- Patches that `git apply` cannot handle (e.g. binary patches) fail the
+  build.
 - Native addons: the build environment provides nodejs, jq, and stdenv only —
   node-gyp builds fail until per-package extra build inputs are supported.
 - Bins invoked by lifecycle scripts are assumed to be Node scripts (shebangs

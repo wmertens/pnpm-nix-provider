@@ -28,6 +28,9 @@ let
       tar -xzf ${fetchSrc node} --strip-components=1 --warning=no-unknown-keyword \
         --delay-directory-restore --no-same-owner --no-same-permissions -C "${dir}"
       chmod -R u+w "${dir}"
+      ${lib.optionalString (node ? patch) ''
+        ${pkgs.gitMinimal}/bin/git -C "${dir}" apply --whitespace=nowarn ${pkgs.writeText "pnpm-patch" node.patch.content}
+      ''}
       jq -r '.bin // empty | if type == "string" then [.] else [.[]] end | .[]' "${dir}/package.json" \
         | while IFS= read -r binFile; do chmod +x "${dir}/$binFile" || true; done
     '';

@@ -111,6 +111,30 @@ test('cli speaks the stdio protocol', { skip: !hasNix }, async () => {
   assert.ok(response.paths['f@1.0.0'].startsWith('/nix/store/'))
 })
 
+test('patches are applied and participate in the input hash', { skip: !hasNix }, async () => {
+  const mkPatch = (replacement) => [
+    'diff --git a/index.js b/index.js',
+    '--- a/index.js',
+    '+++ b/index.js',
+    '@@ -1 +1 @@',
+    '-module.exports = "f"',
+    `+module.exports = ${JSON.stringify(replacement)}`,
+    '',
+  ].join('\n')
+  const patched = (content) => ({
+    'f@1.0.0': { ...nodes['f@1.0.0'], patch: { content, hash: 'irrelevant' } },
+  })
+
+  const first = await materialize({ protocol: 1, nodes: patched(mkPatch('f-patched')) })
+  const index = fs.readFileSync(path.join(first.paths['f@1.0.0'], 'node_modules', 'f', 'index.js'), 'utf8')
+  assert.match(index, /f-patched/)
+
+  const unpatched = await materialize({ protocol: 1, nodes: { 'f@1.0.0': nodes['f@1.0.0'] } })
+  const changed = await materialize({ protocol: 1, nodes: patched(mkPatch('f-other')) })
+  assert.notEqual(first.paths['f@1.0.0'], unpatched.paths['f@1.0.0'])
+  assert.notEqual(first.paths['f@1.0.0'], changed.paths['f@1.0.0'])
+})
+
 test('aborts on a bad integrity hash', { skip: !hasNix }, async () => {
   const bad = {
     'a@1.0.0': {
