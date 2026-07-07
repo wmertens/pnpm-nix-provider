@@ -1,0 +1,19 @@
+{
+  "name": "@pnpm/nix-provider",
+  "version": "0.1.0",
+  "description": "pnpm external package provider that materializes packages as Nix store paths",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "pnpm-nix-provider": "src/cli.js"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test 'test/*.test.js'"
+  }
+}
