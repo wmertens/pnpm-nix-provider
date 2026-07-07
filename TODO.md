@@ -6,9 +6,12 @@ in the source point here.
 ## Correctness / coverage
 
 - **git / directory / injected resolutions**: git deps are deterministic by
-  rev → `fetchGit`-style fixed derivations; local directories and injected
-  workspace packages are mutable local trees → ingest like a host build
-  (hash content, `nix-store --add`). Currently rejected.
+  rev → `fetchGit`-style fixed derivations. Local directories and injected
+  workspace packages are install-time snapshots (pnpm re-syncs them only on
+  install or via `sync-injected-deps-after-scripts`), so ingest the source
+  tree content-addressed at materialization time and key dependents on its
+  hash — unchanged sources hit the cache, a resync mints a new path.
+  Currently rejected.
 - **Richer lifecycle env**: npm sets many `npm_package_*` / `npm_config_*`
   vars that some scripts read; run-scripts.cjs sets a minimal subset.
 - **Non-Node bins on the script PATH**: wrappers assume Node scripts because
