@@ -13,11 +13,14 @@ const hasNix = spawnSync('nix-build', ['--version'], { stdio: 'ignore' }).status
 let workDir
 let server
 let nodes
+let netNode
 
 before(async () => {
   if (!hasNix) return
   workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nix-provider-test-'))
+  process.env.PNPM_NIX_CACHE_DIR = path.join(workDir, 'cache')
   const tarballs = {}
+  server = await serveTarballs(tarballs)
   const addPkg = (manifest, files) => {
     const { buf, integrity } = makeTarball(workDir, manifest, files)
     const urlPath = `/${manifest.name.replace('/', '-')}-${manifest.version}.tgz`
@@ -38,8 +41,14 @@ before(async () => {
       { name: 'f', version: '1.0.0', bin: { 'f-cli': './cli.js' } },
       { 'cli.js': 'require("fs").writeFileSync("ran-f-cli.txt", process.cwd())\n' }
     ),
+    // needs network during postinstall — only works in impure mode
+    net: addPkg({
+      name: 'net',
+      version: '1.0.0',
+      scripts: { postinstall: `node -e "fetch('${server.baseUrl}/ping').then((r) => r.text()).then((t) => require('fs').writeFileSync('net.txt', t))"` },
+    }),
   }
-  server = await serveTarballs(tarballs)
+  tarballs['/ping'] = Buffer.from('pong')
   const dep = (depPath, name) => ({ depPath, name })
   const mkNode = (pkg, name, version, deps = {}) => ({
     name,
@@ -62,6 +71,7 @@ before(async () => {
     'e@1.0.0': mkNode(pkgs.e, 'e', '1.0.0', { f: dep('f@1.0.0', 'f') }),
     'f@1.0.0': mkNode(pkgs.f, 'f', '1.0.0'),
   }
+  netNode = mkNode(pkgs.net, 'net', '1.0.0')
 })
 
 after(async () => {
@@ -148,4 +158,33 @@ test('aborts on a bad integrity hash', { skip: !hasNix }, async () => {
 
 test('rejects unknown protocol versions', async () => {
   await assert.rejects(materialize({ protocol: 2, nodes: {} }), /unsupported protocol/)
+})
+
+test('impure mode builds on the host with network access, keeping the script-free closure pure', { skip: !hasNix }, async () => {
+  const gcRootDir = path.join(workDir, 'gc-roots-impure')
+  const request = { protocol: 1, impure: true, gcRootDir, nodes: { ...nodes, 'net@1.0.0': netNode } }
+  const { paths } = await materialize(request)
+
+  // the network-fetching postinstall succeeded (it would fail in the sandbox)
+  assert.equal(fs.readFileSync(path.join(paths['net@1.0.0'], 'node_modules', 'net', 'net.txt'), 'utf8'), 'pong')
+  // e's postinstall ran f's bin on the host
+  assert.ok(fs.existsSync(path.join(paths['e@1.0.0'], 'node_modules', 'e', 'ran-f-cli.txt')))
+
+  // script-free packages build as the same pure derivations as pure mode
+  const pure = await materialize({ protocol: 1, nodes })
+  assert.equal(paths['a@1.0.0'], pure.paths['a@1.0.0'])
+  assert.equal(paths['f@1.0.0'], pure.paths['f@1.0.0'])
+  assert.notEqual(paths['e@1.0.0'], pure.paths['e@1.0.0'])
+
+  // cycle members and scoped deps still resolve from the host-assembled dirs
+  assert.ok(fs.existsSync(path.join(paths['b@1.0.0'], 'node_modules', 'c', 'package.json')))
+  assert.ok(fs.existsSync(path.join(paths['a@1.0.0'], 'node_modules', '@scope/d', 'package.json')))
+
+  // one gc root protects the mixed pure/host-built set
+  const anchor = fs.readlinkSync(path.join(gcRootDir, 'nix-gc-root'))
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(anchor, 'manifest.json'), 'utf8')), paths)
+
+  // repeat run reuses the host-built paths through the cache
+  const again = await materialize(request)
+  assert.deepEqual(again.paths, paths)
 })

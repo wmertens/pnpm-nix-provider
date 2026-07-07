@@ -83,16 +83,40 @@ any further linking.
   `<gcRootDir>/nix-gc-root`) protects the whole closure. The manifest doubles
   as a machine-readable record of the last install.
 
+## Impure mode
+
+Some lifecycle scripts cannot run inside the Nix sandbox — node-gyp builds
+that need the host toolchain, postinstalls that download binaries. Set
+`PNPM_NIX_IMPURE=1` (or `impure: true` in the request) to build those on the
+host instead:
+
+- Every package is still unpacked and patched purely, which also reveals who
+  has lifecycle scripts.
+- Packages whose whole dependency closure is script-free build in the sandbox
+  as usual and get the exact same store paths as pure mode.
+- The rest is assembled on the host, dependencies first: scripts run with the
+  host's network, toolchain, and HOME, and the result is added to the store
+  content-addressed (`nix-store --add`). A cache under
+  `${XDG_CACHE_HOME:-~/.cache}/pnpm-nix/` maps the pure inputs (raw unpack
+  path, final dependency paths, engine key) to the added path, so unchanged
+  packages are reused across installs.
+- GC safety is unchanged: host-built paths carry no reference metadata, but
+  the anchor derivation imports every final path via `builtins.storePath`,
+  so the single gc root still protects the full set.
+
+Host-built paths are machine-specific — don't push them to a binary cache.
+
 ## Limitations (v1)
 
 - Only registry tarball resolutions (git/local-directory dependencies are
   rejected).
 - Patches that `git apply` cannot handle (e.g. binary patches) fail the
   build.
-- Native addons: the build environment provides nodejs, jq, and stdenv only —
-  node-gyp builds fail until per-package extra build inputs are supported.
+- Native addons: the sandbox provides nodejs, jq, and stdenv only — node-gyp
+  builds fail in pure mode until per-package extra build inputs are
+  supported. Use impure mode for these.
 - Bins invoked by lifecycle scripts are assumed to be Node scripts (shebangs
   can't resolve `/usr/bin/env` inside the sandbox).
 - Legacy `directories.bin` manifests are ignored.
-- Lifecycle scripts that need network access fail (Nix sandbox); such packages
-  need overrides, like every granular Nix-JS integration.
+- Lifecycle scripts that need network access fail in pure mode (Nix sandbox);
+  use impure mode for these.

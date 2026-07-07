@@ -22,7 +22,9 @@ for (const event of events) {
     stdio: 'inherit',
     env: {
       ...process.env,
-      HOME: process.env.TMPDIR ?? '/tmp',
+      // Inside the sandbox HOME is /homeless-shelter; on the host (impure
+      // mode) builds may legitimately want the real HOME (~/.npmrc, caches).
+      HOME: process.env.NIX_BUILD_TOP != null ? (process.env.TMPDIR ?? '/tmp') : process.env.HOME,
       PATH: `${binDir}:${path.dirname(process.execPath)}:${process.env.PATH}`,
       npm_lifecycle_event: event,
       npm_package_name: manifest.name,

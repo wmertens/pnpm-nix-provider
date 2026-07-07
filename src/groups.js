@@ -8,9 +8,12 @@ export function buildSpec (nodes) {
   const groups = {}
   const memberOf = {}
   const subdir = {}
+  // Tarjan emits SCCs dependencies-first; keep that order for host builds.
+  const groupOrder = []
   for (const scc of computeSccs(nodes)) {
     const members = [...scc].sort()
     const groupKey = members[0]
+    groupOrder.push(groupKey)
     const first = nodes[groupKey]
     const base = sanitizeDrvName(`${first.name}-${first.version}`)
     groups[groupKey] = {
@@ -27,7 +30,7 @@ export function buildSpec (nodes) {
       seenSubdirs.add(subdir[depPath])
     }
   }
-  return { nodes, groups, memberOf, subdir }
+  return { nodes, groups, memberOf, subdir, groupOrder }
 }
 
 function validateNodes (nodes) {

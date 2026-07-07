@@ -1,7 +1,10 @@
 # Materializes an npm dependency graph as Nix store paths, one derivation per
 # cycle group. The deps.json spec is produced by groups.js (buildSpec).
-{ depsJsonPath, nixpkgs ? <nixpkgs> }:
+# mode "full" assembles complete packages (dep links + lifecycle scripts);
+# mode "raw" stops after unpack+patch (used by the impure host-build path).
+{ depsJsonPath, nixpkgs ? <nixpkgs>, mode ? "full" }:
 let
+  assemble = mode == "full";
   pkgs = import nixpkgs { config = { }; overlays = [ ]; };
   inherit (pkgs) lib;
   spec = builtins.fromJSON (builtins.readFile (/. + depsJsonPath));
@@ -64,14 +67,14 @@ let
   # upgrade path when someone needs them.
   mkGroup = groupKey: group:
     pkgs.runCommand group.drvName
-      {
-        nativeBuildInputs = [ pkgs.jq pkgs.nodejs ];
-        pnpmEngine = nodes.${groupKey}.engine or "";
-      }
+      ({ nativeBuildInputs = [ pkgs.jq ] ++ lib.optional assemble pkgs.nodejs; }
+        // lib.optionalAttrs assemble { pnpmEngine = nodes.${groupKey}.engine or ""; })
       ''
         ${lib.concatMapStrings mkUnpack group.members}
-        ${lib.concatMapStrings (mkDepLinks groupKey) group.members}
-        ${lib.concatMapStrings mkBuild group.members}
+        ${lib.optionalString assemble ''
+          ${lib.concatMapStrings (mkDepLinks groupKey) group.members}
+          ${lib.concatMapStrings mkBuild group.members}
+        ''}
       '';
 in {
   anchor = pkgs.writeTextFile {
