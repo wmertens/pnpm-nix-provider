@@ -11,35 +11,40 @@ const RUN_SCRIPTS = path.join(SRC_DIR, 'run-scripts.cjs')
 const SCRIPT_EVENTS = ['preinstall', 'install', 'postinstall']
 
 /**
- * Impure materialization for graphs containing lifecycle scripts that may
- * not run in the sandbox (native addons, network-fetching postinstalls).
+ * Group-by-group materialization, used whenever the single batch build is
+ * not enough: impure mode, rebuilds, and the pure-mode retry after a failed
+ * batch.
  *
  * Every package is first unpacked+patched purely ("raw" derivations), which
  * also reveals who has lifecycle scripts. Groups whose whole closure is
- * script-free build in the sandbox exactly like pure mode — identical
- * derivations, identical store paths. Each remaining group is then tried,
- * dependencies first:
+ * script-free build in the sandbox in one batch — identical derivations,
+ * identical store paths to pure mode. Each remaining group then takes the
+ * first rung that works, dependencies first:
  *
- * 1. A pure sandbox build with its build rules applied (plus the generic
- *    native recipe when the package looks like a native addon). Success
- *    means a real derivation output, shareable like any other.
- * 2. Otherwise the group is assembled on the host: raw output copied,
- *    dependency symlinks pointed at the final paths, scripts run with the
- *    host's network and toolchain, and the result added content-addressed
- *    with `nix-store --add`.
+ * 1. A sandbox build with its build rules applied (plus the generic native
+ *    recipe when the package looks like a native addon). Success means a
+ *    real derivation output, shareable like any other.
+ * 2. With hostFallback (impure mode), assembly on the host: raw output
+ *    copied, dependency symlinks pointed at the final paths, scripts run
+ *    with the host's network and toolchain, and the result added
+ *    content-addressed with `nix-store --add`. Host-built groups are
+ *    "pinned": later groups reference them through builtins.storePath, so a
+ *    pure dependent can still build in the sandbox on top of them.
+ * 3. If the group still cannot be built and every member is an optional
+ *    dependency, it is skipped: the group is dropped from the graph, links
+ *    to it are scrubbed from dependents, and it is reported in the
+ *    response's `skipped` list. Otherwise the install aborts.
  *
- * Host-built groups are "pinned": later groups reference them through
- * builtins.storePath, so a pure dependent can still build in the sandbox on
- * top of a host-built dependency. Added paths carry no reference metadata,
- * but gc safety doesn't need it: the final anchor manifest references every
- * final path, so the single gc root protects the full set. A cache maps each
- * group's pure inputs (raw path, final dep paths, rules, engine) to its
- * final path so unchanged groups are reused across installs.
+ * Host-added paths carry no reference metadata, but gc safety doesn't need
+ * it: the final anchor pins every group to the exact path this run used, so
+ * the single gc root protects the full set. A cache maps each group's pure
+ * inputs (raw path, final dep paths, rules, engine) to its final path so
+ * unchanged groups are reused across installs; forceRebuild bypasses it.
  */
-export async function materializeImpure (request, spec, opts = {}) {
+export async function materializeGranular (request, spec, opts, { hostFallback, forceRebuild = false }) {
   const nixStore = opts.nixStore ?? 'nix-store'
   const nixOpts = { nixpkgs: request.nixpkgs, nixBuild: opts.nixBuild }
-  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'pnpm-nix-impure-'))
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'pnpm-nix-granular-'))
   try {
     // The temp out-links keep intermediate results alive until the anchor is rooted.
     const raw = await nixBuildManifest(spec, { mode: 'raw', outLink: path.join(tmp, 'raw-root'), ...nixOpts })
@@ -49,8 +54,8 @@ export async function materializeImpure (request, spec, opts = {}) {
       if (await analyzeGroup(groupKey, group, spec, raw)) scriptGroups.add(groupKey)
     }
 
-    // A group stays in the plain pure batch when neither it nor anything
-    // below it runs scripts.
+    // A group joins the plain pure batch when neither it nor anything below
+    // it runs scripts.
     const pureGroups = new Set()
     for (const groupKey of spec.groupOrder) {
       const group = spec.groups[groupKey]
@@ -77,28 +82,44 @@ export async function materializeImpure (request, spec, opts = {}) {
 
     const cache = await loadCache()
     const pinned = {}
+    const skippedGroups = new Set()
+    const skipped = []
     let attemptCount = 0
     for (const groupKey of spec.groupOrder) {
-      if (pureGroups.has(groupKey)) continue
+      if (pureGroups.has(groupKey) || skippedGroups.has(groupKey)) continue
       const group = spec.groups[groupKey]
       const key = inputKey(groupKey, group, spec, raw, finalRoots)
-      let finalRoot = cache.entries[key]
-      if (finalRoot == null || !(await isValidStorePath(nixStore, finalRoot))) {
+      let finalRoot = forceRebuild ? null : cache.entries[key]
+      if (finalRoot != null && (await isValidStorePath(nixStore, finalRoot))) {
+        if (!(await hasDeriver(nixStore, finalRoot))) pinned[groupKey] = finalRoot
+        finalRoots[groupKey] = finalRoot
+        continue
+      }
+      finalRoot = null
+      try {
+        finalRoot = await nixBuildGroup({ ...spec, pinned }, groupKey, {
+          outLink: path.join(tmp, `attempt-${attemptCount++}`),
+          ...nixOpts,
+        })
+      } catch {}
+      if (finalRoot == null && hostFallback) {
+        process.stderr.write(`pnpm-nix: sandbox build of ${groupKey} failed, building on the host\n`)
         try {
-          finalRoot = await nixBuildGroup({ ...spec, pinned }, groupKey, {
-            outLink: path.join(tmp, `attempt-${attemptCount++}`),
-            ...nixOpts,
-          })
-        } catch {
-          process.stderr.write(`pnpm-nix: sandbox build of ${groupKey} failed, building on the host\n`)
           finalRoot = await assembleOnHost(groupKey, group, spec, raw, finalRoots, tmp, nixStore)
           pinned[groupKey] = finalRoot
-        }
-        cache.entries[key] = finalRoot
-        await saveCache(cache)
-      } else if (!(await hasDeriver(nixStore, finalRoot))) {
-        pinned[groupKey] = finalRoot
+        } catch {}
       }
+      if (finalRoot == null) {
+        if (group.members.every((depPath) => spec.nodes[depPath].optional === true)) {
+          process.stderr.write(`pnpm-nix: skipping optional ${groupKey} (build failed)\n`)
+          skippedGroups.add(groupKey)
+          scrubGroup(spec, groupKey, skipped)
+          continue
+        }
+        throw new Error(`building ${groupKey} failed`)
+      }
+      cache.entries[key] = finalRoot
+      await saveCache(cache)
       finalRoots[groupKey] = finalRoot
     }
 
@@ -107,7 +128,9 @@ export async function materializeImpure (request, spec, opts = {}) {
     // and the single gc root protects the full set, pure or added.
     const outLink = (await gcRootLink(request.gcRootDir)) ?? path.join(tmp, 'anchor')
     const paths = await nixBuildManifest({ ...spec, pinned: finalRoots }, { mode: 'full', outLink, ...nixOpts })
-    return { protocol: PROTOCOL_VERSION, paths }
+    const response = { protocol: PROTOCOL_VERSION, paths }
+    if (skipped.length > 0) response.skipped = skipped
+    return response
   } finally {
     await fs.rm(tmp, { recursive: true, force: true })
   }
@@ -128,6 +151,25 @@ async function analyzeGroup (groupKey, group, spec, raw) {
     }
   }
   return hasScripts
+}
+
+// Drops a failed optional group: its members leave the graph and every edge
+// into it is scrubbed, matching pnpm's optional-dependency semantics.
+function scrubGroup (spec, groupKey, skipped) {
+  const members = new Set(spec.groups[groupKey].members)
+  for (const depPath of members) {
+    skipped.push(depPath)
+    delete spec.memberOf[depPath]
+    delete spec.subdir[depPath]
+    delete spec.nodes[depPath]
+  }
+  delete spec.groups[groupKey]
+  delete spec.rules[groupKey]
+  for (const node of Object.values(spec.nodes)) {
+    for (const [alias, dep] of Object.entries(node.deps ?? {})) {
+      if (members.has(dep.depPath)) delete node.deps[alias]
+    }
+  }
 }
 
 // The pure subgraph is closed by construction, so the subset is a valid spec
@@ -204,7 +246,7 @@ async function isValidStorePath (nixStore, storePath) {
 
 // Distinguishes derivation outputs from host-added paths (which must be
 // pinned): added paths have no deriver.
-async function hasDeriver (nixStore, storePath) {
+export async function hasDeriver (nixStore, storePath) {
   try {
     const deriver = (await run(nixStore, ['--query', '--deriver', storePath], { quiet: true })).trim()
     return deriver.endsWith('.drv')
@@ -227,8 +269,8 @@ async function loadCache () {
   return { version: 1, entries: {} }
 }
 
-// ponytail: no lock; concurrent installs race to last-writer-wins, which only
-// costs a redundant rebuild — add file locking if that ever matters.
+// TODO(TODO.md): no lock; concurrent installs race to last-writer-wins,
+// which only costs a redundant rebuild.
 async function saveCache (cache) {
   await fs.mkdir(path.dirname(cacheFile()), { recursive: true })
   await fs.writeFile(cacheFile(), JSON.stringify(cache))

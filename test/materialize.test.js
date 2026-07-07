@@ -16,6 +16,8 @@ let nodes
 let netNode
 let ruleNodes
 let onnetNode
+let flakyNode
+let optNodes
 
 before(async () => {
   if (!hasNix) return
@@ -67,6 +69,19 @@ before(async () => {
       version: '1.0.0',
       scripts: { postinstall: 'node -e "require(\'fs\').writeFileSync(\'built.txt\', \'ok\')"' },
     }),
+    // non-reproducible build output
+    flaky: addPkg({
+      name: 'flaky',
+      version: '1.0.0',
+      scripts: { postinstall: 'node -e "require(\'fs\').writeFileSync(\'t.txt\', String(Date.now()))"' },
+    }),
+    // optional dependency whose build always fails
+    optfail: addPkg({
+      name: 'optfail',
+      version: '1.0.0',
+      scripts: { postinstall: 'node -e "process.exit(1)"' },
+    }),
+    optuser: addPkg({ name: 'optuser', version: '1.0.0' }),
   }
   tarballs['/ping'] = Buffer.from('pong')
   const rulesFile = path.join(workDir, 'rules.json')
@@ -103,6 +118,11 @@ before(async () => {
     'envy@1.0.0': mkNode(pkgs.envy, 'envy', '1.0.0'),
   }
   onnetNode = mkNode(pkgs.onnet, 'onnet', '1.0.0', { net: dep('net@1.0.0', 'net') })
+  flakyNode = mkNode(pkgs.flaky, 'flaky', '1.0.0')
+  optNodes = {
+    'optfail@1.0.0': { ...mkNode(pkgs.optfail, 'optfail', '1.0.0'), optional: true },
+    'optuser@1.0.0': mkNode(pkgs.optuser, 'optuser', '1.0.0', { optfail: dep('optfail@1.0.0', 'optfail') }),
+  }
 })
 
 after(async () => {
@@ -255,4 +275,30 @@ test('pure dependents build in the sandbox on top of pinned host-built deps', { 
     spawnSync('nix-store', ['-q', '--deriver', path.dirname(pkgPath)], { encoding: 'utf8' }).stdout.trim()
   assert.ok(!deriverOf(paths['net@1.0.0']).endsWith('.drv'))
   assert.ok(deriverOf(paths['onnet@1.0.0']).endsWith('.drv'))
+
+  // rebuild bypasses the cache; deterministic scripts land on the same path
+  const rebuilt = await materialize({ ...request, rebuild: true })
+  assert.deepEqual(rebuilt.paths, paths)
+})
+
+test('failing optional dependencies are skipped via the group-by-group pure retry', { skip: !hasNix }, async () => {
+  const { paths, skipped } = await materialize({ protocol: 1, nodes: optNodes })
+  assert.deepEqual(skipped, ['optfail@1.0.0'])
+  assert.equal(paths['optfail@1.0.0'], undefined)
+  const optuserModules = path.join(paths['optuser@1.0.0'], 'node_modules')
+  assert.ok(fs.existsSync(path.join(optuserModules, 'optuser', 'package.json')))
+  assert.ok(!fs.existsSync(path.join(optuserModules, 'optfail')))
+})
+
+test('check reports non-reproducible builds with a diff excerpt', { skip: !hasNix }, async () => {
+  const { paths, check } = await materialize({
+    protocol: 1,
+    check: true,
+    nodes: { 'flaky@1.0.0': flakyNode, 'f@1.0.0': nodes['f@1.0.0'] },
+  })
+  assert.ok(paths['flaky@1.0.0'].startsWith('/nix/store/'))
+  const byGroup = Object.fromEntries(check.map((entry) => [entry.group, entry]))
+  assert.equal(byGroup['f@1.0.0'].reproducible, true)
+  assert.equal(byGroup['flaky@1.0.0'].reproducible, false)
+  assert.ok(byGroup['flaky@1.0.0'].diff.length > 0)
 })

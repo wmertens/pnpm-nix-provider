@@ -1,8 +1,9 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { checkReproducibility } from './check.js'
 import { buildSpec } from './groups.js'
-import { materializeImpure } from './impure.js'
+import { materializeGranular } from './granular.js'
 import { gcRootLink, nixBuildManifest, PROTOCOL_VERSION } from './nix.js'
 import { groupRules, loadRules } from './rules.js'
 
@@ -15,20 +16,24 @@ export { PROTOCOL_VERSION }
  *   protocol: 1,
  *   gcRootDir?: string,   // where to register the indirect gc root symlink
  *   nixpkgs?: string,     // path or URL overriding <nixpkgs>
- *   impure?: boolean,     // build lifecycle scripts on the host (see impure.js)
+ *   impure?: boolean,     // allow host builds as a last resort (see granular.js)
+ *   rebuild?: boolean,    // bypass the host-build cache and rebuild
+ *   check?: boolean,      // add a byte-for-byte reproducibility report
  *   nodes: {
  *     [depPath]: {
  *       name, version, tarball, integrity,
  *       deps?: { [alias]: { depPath, name } },
+ *       optional?: boolean, // a failing build skips the package instead of aborting
  *       engine?: string,  // platform key, folded into the drv for building nodes
  *       patch?: { content: string, hash: string },
  *     }
  *   }
  * }
  *
- * Response: { protocol: 1, paths: { [depPath]: storePathDir } } where
- * `${storePathDir}/node_modules/${name}` is the package directory.
- * Any failure rejects — callers must abort the install.
+ * Response: { protocol: 1, paths, skipped?, check? } where
+ * `${paths[depPath]}/node_modules/${name}` is the package directory,
+ * `skipped` lists optional depPaths whose build failed, and `check` is the
+ * reproducibility report. Any failure rejects — callers must abort.
  */
 export async function materialize (request, opts = {}) {
   if (request?.protocol !== PROTOCOL_VERSION) {
@@ -36,8 +41,17 @@ export async function materialize (request, opts = {}) {
   }
   const spec = buildSpec(request.nodes ?? {})
   spec.rules = groupRules(spec, await loadRules())
-  if (request.impure === true || process.env.PNPM_NIX_IMPURE === '1') {
-    return materializeImpure(request, spec, opts)
+  const impure = request.impure === true || process.env.PNPM_NIX_IMPURE === '1'
+  const response = await materializeInner(request, spec, opts, impure)
+  if (request.check === true) {
+    response.check = await checkReproducibility(spec, response.paths, opts, { nixpkgs: request.nixpkgs, nixBuild: opts.nixBuild })
+  }
+  return response
+}
+
+async function materializeInner (request, spec, opts, impure) {
+  if (impure || request.rebuild === true) {
+    return materializeGranular(request, spec, opts, { hostFallback: impure, forceRebuild: request.rebuild === true })
   }
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'pnpm-nix-provider-'))
   try {
@@ -49,6 +63,12 @@ export async function materialize (request, opts = {}) {
       nixBuild: opts.nixBuild,
     })
     return { protocol: PROTOCOL_VERSION, paths }
+  } catch {
+    // A failed batch gets a second chance group by group: build rules and the
+    // generic native recipe are tried per group, and failing optional
+    // dependencies are skipped instead of aborting. Still no host builds.
+    process.stderr.write('pnpm-nix: batch build failed, retrying group by group\n')
+    return materializeGranular(request, spec, opts, { hostFallback: false })
   } finally {
     await fs.rm(tmp, { recursive: true, force: true })
   }

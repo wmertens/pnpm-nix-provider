@@ -42,12 +42,17 @@ Request:
       "tarball": "https://registry.npmjs.org/foo/-/foo-1.2.3.tgz",
       "integrity": "sha512-…",                    // SRI, used verbatim as the fixed-output hash
       "deps": { "<alias>": { "depPath": "<other depPath>", "name": "bar" } },
+      "optional": true,                           // a failing build skips the package instead of aborting
       "engine": "linux;x64;node22",               // optional platform key folded into the derivation
       "patch": { "content": "diff --git …", "hash": "…" } // optional git-style patch, applied after unpack
     }
   }
 }
 ```
+
+Top-level request flags (also settable via CLI flags of the same name):
+`impure` allows host builds (see below), `rebuild` bypasses the host-build
+cache, and `check` appends a reproducibility report to the response.
 
 Patches are deterministic, so the patch content is simply another derivation
 input: a changed patch yields a new store path, an unchanged one hits the
@@ -61,7 +66,12 @@ already encode resolved peer dependencies).
 Response:
 
 ```jsonc
-{ "protocol": 1, "paths": { "<depPath>": "/nix/store/…" } }
+{
+  "protocol": 1,
+  "paths": { "<depPath>": "/nix/store/…" },
+  "skipped": ["<depPath>"],                          // optional deps whose build failed
+  "check": [{ "group": "…", "reproducible": true }]  // only with check: true
+}
 ```
 
 `paths[depPath] + "/node_modules/" + name` is the package directory. Each
@@ -109,6 +119,12 @@ node-gyp/node-pre-gyp/prebuild-install) additionally get a **generic native
 recipe** in impure mode: python3 on PATH, `npm_config_nodedir` pointing at
 the nixpkgs Node (so headers aren't downloaded), and npm's bundled node-gyp
 exposed on PATH.
+
+In pure mode, a failed batch build is retried group by group with rules and
+the generic native recipe applied, and failing **optional** dependencies are
+skipped (reported in the response's `skipped` list) instead of aborting —
+matching pnpm's optional-dependency semantics. Only non-optional failures
+abort.
 
 ## Impure mode
 

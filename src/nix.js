@@ -47,12 +47,12 @@ export async function nixBuildManifest (spec, { mode, outLink, nixpkgs, nixBuild
 }
 
 /** nix-builds a single group and returns its store path. */
-export async function nixBuildGroup (spec, groupKey, { outLink, nixpkgs, nixBuild }) {
+export async function nixBuildGroup (spec, groupKey, { outLink, nixpkgs, nixBuild, extraArgs = [] }) {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'pnpm-nix-eval-'))
   try {
     const depsJsonPath = path.join(tmp, 'deps.json')
     await fs.writeFile(depsJsonPath, JSON.stringify(spec))
-    const args = [TEMPLATE, '--argstr', 'depsJsonPath', depsJsonPath, '--argstr', 'mode', 'full', '-A', `groups."${groupKey}"`, '-o', outLink]
+    const args = [TEMPLATE, '--argstr', 'depsJsonPath', depsJsonPath, '--argstr', 'mode', 'full', '-A', `groups."${groupKey}"`, '-o', outLink, ...extraArgs]
     if (nixpkgs) args.push('-I', `nixpkgs=${nixpkgs}`)
     return (await run(nixBuild ?? 'nix-build', args)).trim()
   } finally {
