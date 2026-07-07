@@ -14,6 +14,8 @@ let workDir
 let server
 let nodes
 let netNode
+let ruleNodes
+let onnetNode
 
 before(async () => {
   if (!hasNix) return
@@ -47,8 +49,32 @@ before(async () => {
       version: '1.0.0',
       scripts: { postinstall: `node -e "fetch('${server.baseUrl}/ping').then((r) => r.text()).then((t) => require('fs').writeFileSync('net.txt', t))"` },
     }),
+    // needs a tool that only a build rule can provide
+    tool: addPkg({
+      name: 'tool',
+      version: '1.0.0',
+      scripts: { postinstall: 'hello > used-hello.txt' },
+    }),
+    // reads an env var that only a build rule can set
+    envy: addPkg({
+      name: 'envy',
+      version: '1.0.0',
+      scripts: { postinstall: 'node -e "require(\'fs\').writeFileSync(\'env.txt\', process.env.MY_RULE_VAR || \'missing\')"' },
+    }),
+    // script-bearing dependent of the host-built net package
+    onnet: addPkg({
+      name: 'onnet',
+      version: '1.0.0',
+      scripts: { postinstall: 'node -e "require(\'fs\').writeFileSync(\'built.txt\', \'ok\')"' },
+    }),
   }
   tarballs['/ping'] = Buffer.from('pong')
+  const rulesFile = path.join(workDir, 'rules.json')
+  fs.writeFileSync(rulesFile, JSON.stringify({
+    tool: { extraInputs: ['hello'] },
+    envy: { env: { MY_RULE_VAR: 'from-rule' } },
+  }))
+  process.env.PNPM_NIX_RULES = rulesFile
   const dep = (depPath, name) => ({ depPath, name })
   const mkNode = (pkg, name, version, deps = {}) => ({
     name,
@@ -72,6 +98,11 @@ before(async () => {
     'f@1.0.0': mkNode(pkgs.f, 'f', '1.0.0'),
   }
   netNode = mkNode(pkgs.net, 'net', '1.0.0')
+  ruleNodes = {
+    'tool@1.0.0': mkNode(pkgs.tool, 'tool', '1.0.0'),
+    'envy@1.0.0': mkNode(pkgs.envy, 'envy', '1.0.0'),
+  }
+  onnetNode = mkNode(pkgs.onnet, 'onnet', '1.0.0', { net: dep('net@1.0.0', 'net') })
 })
 
 after(async () => {
@@ -170,11 +201,12 @@ test('impure mode builds on the host with network access, keeping the script-fre
   // e's postinstall ran f's bin on the host
   assert.ok(fs.existsSync(path.join(paths['e@1.0.0'], 'node_modules', 'e', 'ran-f-cli.txt')))
 
-  // script-free packages build as the same pure derivations as pure mode
+  // script-free packages build as the same pure derivations as pure mode,
+  // and e's sandbox attempt succeeds so it stays pure too
   const pure = await materialize({ protocol: 1, nodes })
   assert.equal(paths['a@1.0.0'], pure.paths['a@1.0.0'])
   assert.equal(paths['f@1.0.0'], pure.paths['f@1.0.0'])
-  assert.notEqual(paths['e@1.0.0'], pure.paths['e@1.0.0'])
+  assert.equal(paths['e@1.0.0'], pure.paths['e@1.0.0'])
 
   // cycle members and scoped deps still resolve from the host-assembled dirs
   assert.ok(fs.existsSync(path.join(paths['b@1.0.0'], 'node_modules', 'c', 'package.json')))
@@ -187,4 +219,40 @@ test('impure mode builds on the host with network access, keeping the script-fre
   // repeat run reuses the host-built paths through the cache
   const again = await materialize(request)
   assert.deepEqual(again.paths, paths)
+})
+
+test('build rules let script packages build purely in impure mode', { skip: !hasNix }, async () => {
+  const request = { protocol: 1, impure: true, nodes: ruleNodes }
+  const { paths } = await materialize(request)
+
+  const toolDir = path.join(paths['tool@1.0.0'], 'node_modules', 'tool')
+  assert.match(fs.readFileSync(path.join(toolDir, 'used-hello.txt'), 'utf8'), /Hello/)
+  const envyDir = path.join(paths['envy@1.0.0'], 'node_modules', 'envy')
+  assert.equal(fs.readFileSync(path.join(envyDir, 'env.txt'), 'utf8'), 'from-rule')
+
+  // identical to a pure-mode build with the same rules — no host fallback ran
+  const pure = await materialize({ protocol: 1, nodes: ruleNodes })
+  assert.deepEqual(pure.paths, paths)
+})
+
+test('pure dependents build in the sandbox on top of pinned host-built deps', { skip: !hasNix }, async () => {
+  const request = {
+    protocol: 1,
+    impure: true,
+    nodes: { 'net@1.0.0': netNode, 'onnet@1.0.0': onnetNode },
+  }
+  const { paths } = await materialize(request)
+
+  assert.equal(fs.readFileSync(path.join(paths['net@1.0.0'], 'node_modules', 'net', 'net.txt'), 'utf8'), 'pong')
+  assert.ok(fs.existsSync(path.join(paths['onnet@1.0.0'], 'node_modules', 'onnet', 'built.txt')))
+  assert.equal(
+    fs.realpathSync(path.join(paths['onnet@1.0.0'], 'node_modules', 'net')),
+    fs.realpathSync(path.join(paths['net@1.0.0'], 'node_modules', 'net'))
+  )
+
+  // net was host-added (no deriver); onnet is a genuine derivation output
+  const deriverOf = (pkgPath) =>
+    spawnSync('nix-store', ['-q', '--deriver', path.dirname(pkgPath)], { encoding: 'utf8' }).stdout.trim()
+  assert.ok(!deriverOf(paths['net@1.0.0']).endsWith('.drv'))
+  assert.ok(deriverOf(paths['onnet@1.0.0']).endsWith('.drv'))
 })

@@ -4,6 +4,7 @@ import path from 'node:path'
 import { buildSpec } from './groups.js'
 import { materializeImpure } from './impure.js'
 import { gcRootLink, nixBuildManifest, PROTOCOL_VERSION } from './nix.js'
+import { groupRules, loadRules } from './rules.js'
 
 export { PROTOCOL_VERSION }
 
@@ -34,6 +35,7 @@ export async function materialize (request, opts = {}) {
     throw new Error(`unsupported protocol version ${request?.protocol}; this provider speaks version ${PROTOCOL_VERSION}`)
   }
   const spec = buildSpec(request.nodes ?? {})
+  spec.rules = groupRules(spec, await loadRules())
   if (request.impure === true || process.env.PNPM_NIX_IMPURE === '1') {
     return materializeImpure(request, spec, opts)
   }

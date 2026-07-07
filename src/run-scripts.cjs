@@ -56,14 +56,21 @@ function setUpBins () {
       ? { [path.basename(depManifest.name ?? entry)]: depManifest.bin }
       : (depManifest.bin ?? {})
     for (const [binName, rel] of Object.entries(bins)) {
-      const wrapper = path.join(binDir, binName)
-      if (fs.existsSync(wrapper)) continue
-      const target = path.resolve(nodeModulesDir, entry, rel)
-      // ponytail: assumes node bins; /usr/bin/env is absent in the sandbox so
-      // shebangs cannot resolve — wrap with the running node instead.
-      fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${shQuote(process.execPath)} ${shQuote(target)} "$@"\n`, { mode: 0o755 })
+      writeWrapper(binName, path.resolve(nodeModulesDir, entry, rel))
     }
   }
+  // native builds expect node-gyp on PATH like npm provides it; use npm's
+  // bundled copy when no dependency supplies one
+  const npmNodeGyp = path.resolve(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'node_modules', 'node-gyp', 'bin', 'node-gyp.js')
+  if (fs.existsSync(npmNodeGyp)) writeWrapper('node-gyp', npmNodeGyp)
+}
+
+function writeWrapper (binName, target) {
+  const wrapper = path.join(binDir, binName)
+  if (fs.existsSync(wrapper)) return
+  // ponytail: assumes node bins; /usr/bin/env is absent in the sandbox so
+  // shebangs cannot resolve — wrap with the running node instead.
+  fs.writeFileSync(wrapper, `#!/bin/sh\nexec ${shQuote(process.execPath)} ${shQuote(target)} "$@"\n`, { mode: 0o755 })
 }
 
 function listPackages (dir) {

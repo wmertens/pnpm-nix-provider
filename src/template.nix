@@ -1,5 +1,9 @@
 # Materializes an npm dependency graph as Nix store paths, one derivation per
-# cycle group. The deps.json spec is produced by groups.js (buildSpec).
+# cycle group. The deps.json spec is produced by groups.js (buildSpec):
+#   nodes/groups/memberOf/subdir — the graph and its layout
+#   rules  — per-group build requirements (extra nixpkgs inputs, env vars)
+#   pinned — groups already materialized outside this eval (host builds);
+#            their paths are imported with builtins.storePath instead of built
 # mode "full" assembles complete packages (dep links + lifecycle scripts);
 # mode "raw" stops after unpack+patch (used by the impure host-build path).
 { depsJsonPath, nixpkgs ? <nixpkgs>, mode ? "full" }:
@@ -9,16 +13,32 @@ let
   inherit (pkgs) lib;
   spec = builtins.fromJSON (builtins.readFile (/. + depsJsonPath));
   inherit (spec) nodes groups memberOf subdir;
+  rules = spec.rules or { };
+  pinned = spec.pinned or { };
 
   fetchSrc = node: pkgs.fetchurl {
     url = node.tarball;
     hash = node.integrity;
   };
 
+  resolveInput = name:
+    lib.attrByPath (lib.splitString "." name)
+      (throw "pnpm-nix build rule input '${name}' not found in nixpkgs")
+      pkgs;
+
+  ruleEnv = rule: builtins.mapAttrs
+    (_: value: if builtins.isAttrs value then "${resolveInput value.drv}" else value)
+    (rule.env or { });
+
   groupDrvs = lib.mapAttrs mkGroup groups;
 
+  rootOf = groupKey:
+    if pinned ? ${groupKey}
+    then builtins.storePath pinned.${groupKey}
+    else groupDrvs.${groupKey};
+
   # Directory whose node_modules/<name> is the package dir for a depPath.
-  pkgDirOf = depPath: "${groupDrvs.${memberOf.${depPath}}}/${subdir.${depPath}}";
+  pkgDirOf = depPath: "${rootOf memberOf.${depPath}}/${subdir.${depPath}}";
 
   scopeUp = alias: lib.optionalString (lib.hasPrefix "@" alias) "../";
 
@@ -62,13 +82,14 @@ let
       node ${./run-scripts.cjs} "$out/${subdir.${depPath}}/node_modules/${node.name}"
     '';
 
-  # ponytail: native addons (node-gyp) will fail — only nodejs, jq, and stdenv
-  # are in the build environment; per-package extra build inputs are the
-  # upgrade path when someone needs them.
   mkGroup = groupKey: group:
+    let rule = rules.${groupKey} or { }; in
     pkgs.runCommand group.drvName
-      ({ nativeBuildInputs = [ pkgs.jq ] ++ lib.optional assemble pkgs.nodejs; }
-        // lib.optionalAttrs assemble { pnpmEngine = nodes.${groupKey}.engine or ""; })
+      ({
+        nativeBuildInputs = [ pkgs.jq ]
+          ++ lib.optional assemble pkgs.nodejs
+          ++ lib.optionals assemble (map resolveInput (rule.extraInputs or [ ]));
+      } // lib.optionalAttrs assemble ({ pnpmEngine = nodes.${groupKey}.engine or ""; } // ruleEnv rule))
       ''
         ${lib.concatMapStrings mkUnpack group.members}
         ${lib.optionalString assemble ''
@@ -77,11 +98,13 @@ let
         ''}
       '';
 in {
+  # Interpolating the store paths gives the manifest a reference on every
+  # group — pinned ones included — so one gc root on the anchor protects the
+  # whole closure.
   anchor = pkgs.writeTextFile {
     name = "pnpm-nix-manifest";
     destination = "/manifest.json";
-    # Interpolating the store paths gives the manifest a reference on every
-    # group, so one gc root on the anchor protects the whole closure.
     text = builtins.toJSON (lib.mapAttrs (depPath: _: pkgDirOf depPath) memberOf);
   };
+  groups = groupDrvs;
 }
