@@ -60,9 +60,18 @@ function setUpBins () {
     }
   }
   // native builds expect node-gyp on PATH like npm provides it; use npm's
-  // bundled copy when no dependency supplies one
-  const npmNodeGyp = path.resolve(path.dirname(process.execPath), '..', 'lib', 'node_modules', 'npm', 'node_modules', 'node-gyp', 'bin', 'node-gyp.js')
-  if (fs.existsSync(npmNodeGyp)) writeWrapper('node-gyp', npmNodeGyp)
+  // bundled copy when no dependency supplies one. npm_config_nodedir (set by
+  // the generic native rule) is checked first: process.execPath resolves
+  // symlinks and may land in an npm-less nodejs-slim.
+  const nodeDirs = [process.env.npm_config_nodedir, path.resolve(path.dirname(process.execPath), '..')]
+  for (const nodeDir of nodeDirs) {
+    if (!nodeDir) continue
+    const npmNodeGyp = path.join(nodeDir, 'lib', 'node_modules', 'npm', 'node_modules', 'node-gyp', 'bin', 'node-gyp.js')
+    if (fs.existsSync(npmNodeGyp)) {
+      writeWrapper('node-gyp', npmNodeGyp)
+      break
+    }
+  }
 }
 
 function writeWrapper (binName, target) {

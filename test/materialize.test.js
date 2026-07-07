@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -209,6 +209,42 @@ test('aborts on a bad integrity hash', { skip: !hasNix }, async () => {
 
 test('rejects unknown protocol versions', async () => {
   await assert.rejects(materialize({ protocol: 2, nodes: {} }), /unsupported protocol/)
+})
+
+test('directory resolutions are ingested content-addressed, excluding node_modules', { skip: !hasNix }, async () => {
+  const srcDir = path.join(workDir, 'local-lib')
+  fs.mkdirSync(path.join(srcDir, 'node_modules', 'junk'), { recursive: true })
+  fs.writeFileSync(path.join(srcDir, 'package.json'), JSON.stringify({ name: 'local-lib', version: '1.0.0' }))
+  fs.writeFileSync(path.join(srcDir, 'index.js'), 'module.exports = 1\n')
+  fs.writeFileSync(path.join(srcDir, 'node_modules', 'junk', 'x.txt'), 'should not be ingested')
+  const node = { name: 'local-lib', version: '1.0.0', directory: srcDir, deps: {} }
+
+  const first = await materialize({ protocol: 1, nodes: { 'local-lib@file': node } })
+  const pkgDir = path.join(first.paths['local-lib@file'], 'node_modules', 'local-lib')
+  assert.equal(fs.readFileSync(path.join(pkgDir, 'index.js'), 'utf8'), 'module.exports = 1\n')
+  assert.ok(!fs.existsSync(path.join(pkgDir, 'node_modules')))
+
+  // a source change (pnpm re-sync) mints a new store path; unchanged reuses it
+  fs.writeFileSync(path.join(srcDir, 'index.js'), 'module.exports = 2\n')
+  const second = await materialize({ protocol: 1, nodes: { 'local-lib@file': node } })
+  assert.notEqual(second.paths['local-lib@file'], first.paths['local-lib@file'])
+})
+
+test('git resolutions are fetched by commit', { skip: !hasNix }, async () => {
+  const repoDir = path.join(workDir, 'git-repo')
+  fs.mkdirSync(repoDir)
+  fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ name: 'from-git', version: '1.0.0' }))
+  fs.writeFileSync(path.join(repoDir, 'index.js'), 'module.exports = "git"\n')
+  const git = (...args) => execFileSync('git', ['-C', repoDir, ...args], { encoding: 'utf8' })
+  git('init', '-q')
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A')
+  git('-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init')
+  const commit = git('rev-parse', 'HEAD').trim()
+
+  const node = { name: 'from-git', version: '1.0.0', git: { repo: repoDir, commit }, deps: {} }
+  const { paths } = await materialize({ protocol: 1, nodes: { 'from-git@git': node } })
+  const pkgDir = path.join(paths['from-git@git'], 'node_modules', 'from-git')
+  assert.equal(fs.readFileSync(path.join(pkgDir, 'index.js'), 'utf8'), 'module.exports = "git"\n')
 })
 
 test('impure mode builds on the host with network access, keeping the script-free closure pure', { skip: !hasNix }, async () => {

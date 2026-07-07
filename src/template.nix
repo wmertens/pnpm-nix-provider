@@ -16,10 +16,28 @@ let
   rules = spec.rules or { };
   pinned = spec.pinned or { };
 
-  fetchSrc = node: pkgs.fetchurl {
-    url = node.tarball;
-    hash = node.integrity;
-  };
+  # Registry tarballs are fetched as fixed-output derivations; local
+  # directories (file:/injected deps — install-time snapshots in pnpm) are
+  # imported content-addressed with node_modules and VCS files filtered out;
+  # git deps are fetched by commit.
+  srcOf = node:
+    if node ? directory then
+      lib.cleanSourceWith {
+        name = "${baseNameOf node.directory}-source";
+        src = /. + node.directory;
+        filter = p: type: baseNameOf p != "node_modules" && baseNameOf p != ".git";
+      }
+    else if node ? git then
+      builtins.fetchGit {
+        url = lib.removePrefix "git+" node.git.repo;
+        rev = node.git.commit;
+        allRefs = true;
+      }
+    else
+      pkgs.fetchurl {
+        url = node.tarball;
+        hash = node.integrity;
+      };
 
   resolveInput = name:
     lib.attrByPath (lib.splitString "." name)
@@ -46,10 +64,16 @@ let
     let
       node = nodes.${depPath};
       dir = "$out/${subdir.${depPath}}/node_modules/${node.name}";
+      unpack =
+        if node ? tarball then ''
+          tar -xzf ${srcOf node} --strip-components=1 --warning=no-unknown-keyword \
+            --delay-directory-restore --no-same-owner --no-same-permissions -C "${dir}"
+        '' else ''
+          cp -a ${srcOf node}/. "${dir}/"
+        '';
     in ''
       mkdir -p "${dir}"
-      tar -xzf ${fetchSrc node} --strip-components=1 --warning=no-unknown-keyword \
-        --delay-directory-restore --no-same-owner --no-same-permissions -C "${dir}"
+      ${unpack}
       chmod -R u+w "${dir}"
       ${lib.optionalString (node ? patch) ''
         ${pkgs.gitMinimal}/bin/git -C "${dir}" apply --whitespace=nowarn ${pkgs.writeText "pnpm-patch" node.patch.content}

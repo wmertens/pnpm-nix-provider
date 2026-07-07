@@ -1,3 +1,5 @@
+import path from 'node:path'
+
 /**
  * Nix store paths cannot reference each other cyclically, so every strongly
  * connected component of the dependency graph is materialized as one store
@@ -38,8 +40,11 @@ function validateNodes (nodes) {
     if (!node.name || !node.version) {
       throw new Error(`node ${depPath} is missing name or version`)
     }
-    if (!node.tarball || !node.integrity) {
-      throw new Error(`node ${depPath} has no tarball+integrity resolution; only registry tarballs are supported`)
+    const hasTarball = Boolean(node.tarball && node.integrity)
+    const hasDirectory = typeof node.directory === 'string' && path.isAbsolute(node.directory)
+    const hasGit = Boolean(node.git?.repo && node.git?.commit)
+    if (!hasTarball && !hasDirectory && !hasGit) {
+      throw new Error(`node ${depPath} has no supported resolution (registry tarball+integrity, absolute directory, or git repo+commit)`)
     }
     for (const [alias, dep] of Object.entries(node.deps ?? {})) {
       if (nodes[dep.depPath] == null) {

@@ -55,12 +55,13 @@ export function mergeRules (base, extra) {
 }
 
 /**
- * Fallback recipe for native addons: python for node-gyp, and the Node
+ * Fallback recipe for native addons: python and a C/C++ toolchain for
+ * node-gyp (runCommand's stdenvNoCC has make but no compiler), and the Node
  * headers so node-gyp does not try to download them. node-gyp itself is
  * provided by run-scripts.cjs from npm's bundled copy.
  */
 export const GENERIC_NATIVE_RULE = {
-  extraInputs: ['python3'],
+  extraInputs: ['python3', 'stdenv.cc'],
   env: { npm_config_nodedir: { drv: 'nodejs' } },
 }
 
