@@ -5,29 +5,18 @@ in the source point here.
 
 ## Correctness / coverage
 
-- **git / directory / injected resolutions**: git deps are deterministic by
-  rev → `fetchGit`-style fixed derivations. Local directories and injected
-  workspace packages are install-time snapshots (pnpm re-syncs them only on
-  install or via `sync-injected-deps-after-scripts`), so ingest the source
-  tree content-addressed at materialization time and key dependents on its
-  hash — unchanged sources hit the cache, a resync mints a new path.
-  Currently rejected.
+- **git deps with a prepare step** (built from source with devDependencies)
+  are still rejected; plain git deps and directory/injected resolutions are
+  supported.
 - **Richer lifecycle env**: npm sets many `npm_package_*` / `npm_config_*`
   vars that some scripts read; run-scripts.cjs sets a minimal subset.
 - **Non-Node bins on the script PATH**: wrappers assume Node scripts because
   `/usr/bin/env` is absent in the sandbox; detect the shebang interpreter
   instead.
 - **Legacy `directories.bin`** manifests are ignored.
-- **Real node-gyp smoke test**: the generic native recipe (python3,
-  `npm_config_nodedir`, npm's bundled node-gyp) is mechanism-tested but not
-  yet exercised against a real published native addon (e.g. better-sqlite3).
 
 ## pnpm integration
 
-- **Headless fast path**: deps-restorer materializes straight from the
-  lockfile; needs the same four touchpoints as the full path (build request
-  from the lockfile graph, repoint dirs, skip import/scripts/dep-bins,
-  honor skipped optionals). Until then provider installs always resolve.
 - **`pnpm rebuild` wiring**: the provider already supports
   `rebuild: true` (bypass host-build cache) and `check: true`
   (byte-for-byte `nix-build --check` with diff excerpts); pnpm's rebuild
