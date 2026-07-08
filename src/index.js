@@ -1,3 +1,4 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -5,7 +6,7 @@ import { checkReproducibility } from './check.js'
 import { buildSpec } from './groups.js'
 import { materializeGranular } from './granular.js'
 import { gcRootLink, nixBuildManifest, PROTOCOL_VERSION } from './nix.js'
-import { groupRules, loadRules } from './rules.js'
+import { groupRules, loadRules, resolveOverridesPath } from './rules.js'
 
 export { PROTOCOL_VERSION }
 
@@ -41,10 +42,23 @@ export async function materialize (request, opts = {}) {
   }
   const spec = buildSpec(request.nodes ?? {})
   spec.rules = groupRules(spec, await loadRules())
+  if (request.nixpkgs == null && process.env.PNPM_NIX_NIXPKGS) {
+    request = { ...request, nixpkgs: process.env.PNPM_NIX_NIXPKGS }
+  }
+  const overridesPath = await resolveOverridesPath()
+  opts = {
+    ...opts,
+    overridesPath,
+    // Overrides participate in the host-build cache key: an edited override
+    // must rebuild what it may affect.
+    overridesHash: overridesPath == null
+      ? null
+      : crypto.createHash('sha256').update(await fs.readFile(overridesPath)).digest('hex'),
+  }
   const impure = request.impure === true || process.env.PNPM_NIX_IMPURE === '1'
   const response = await materializeInner(request, spec, opts, impure)
   if (request.check === true) {
-    response.check = await checkReproducibility(spec, response.paths, opts, { nixpkgs: request.nixpkgs, nixBuild: opts.nixBuild })
+    response.check = await checkReproducibility(spec, response.paths, opts, { nixpkgs: request.nixpkgs, nixBuild: opts.nixBuild, overridesPath })
   }
   return response
 }
@@ -61,6 +75,7 @@ async function materializeInner (request, spec, opts, impure) {
       outLink,
       nixpkgs: request.nixpkgs,
       nixBuild: opts.nixBuild,
+      overridesPath: opts.overridesPath,
     })
     return { protocol: PROTOCOL_VERSION, paths }
   } catch {

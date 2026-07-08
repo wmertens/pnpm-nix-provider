@@ -14,6 +14,8 @@ let workDir
 let server
 let nodes
 let netNode
+let net2Node
+let tool2Node
 let ruleNodes
 let onnetNode
 let flakyNode
@@ -63,6 +65,18 @@ before(async () => {
       version: '1.0.0',
       scripts: { postinstall: 'node -e "require(\'fs\').writeFileSync(\'env.txt\', process.env.MY_RULE_VAR || \'missing\')"' },
     }),
+    // needs a tool that only a Nix override can provide
+    tool2: addPkg({
+      name: 'tool2',
+      version: '1.0.0',
+      scripts: { postinstall: 'hello > used-hello2.txt' },
+    }),
+    // second network-needing package, uncached, for the degraded-store test
+    net2: addPkg({
+      name: 'net2',
+      version: '1.0.0',
+      scripts: { postinstall: `node -e "fetch('${server.baseUrl}/ping').then((r) => r.text()).then((t) => require('fs').writeFileSync('net.txt', t))"` },
+    }),
     // script-bearing dependent of the host-built net package
     onnet: addPkg({
       name: 'onnet',
@@ -90,6 +104,14 @@ before(async () => {
     envy: { env: { MY_RULE_VAR: 'from-rule' } },
   }))
   process.env.PNPM_NIX_RULES = rulesFile
+  const overridesFile = path.join(workDir, 'overrides.nix')
+  fs.writeFileSync(overridesFile, [
+    '{ pkgs, lib }: {',
+    '  "tool2" = drv: drv.overrideAttrs (prev: { nativeBuildInputs = prev.nativeBuildInputs ++ [ pkgs.hello ]; });',
+    '}',
+    '',
+  ].join('\n'))
+  process.env.PNPM_NIX_OVERRIDES = overridesFile
   const dep = (depPath, name) => ({ depPath, name })
   const mkNode = (pkg, name, version, deps = {}) => ({
     name,
@@ -113,6 +135,8 @@ before(async () => {
     'f@1.0.0': mkNode(pkgs.f, 'f', '1.0.0'),
   }
   netNode = mkNode(pkgs.net, 'net', '1.0.0')
+  net2Node = mkNode(pkgs.net2, 'net2', '1.0.0')
+  tool2Node = mkNode(pkgs.tool2, 'tool2', '1.0.0')
   ruleNodes = {
     'tool@1.0.0': mkNode(pkgs.tool, 'tool', '1.0.0'),
     'envy@1.0.0': mkNode(pkgs.envy, 'envy', '1.0.0'),
@@ -324,6 +348,42 @@ test('failing optional dependencies are skipped via the group-by-group pure retr
   const optuserModules = path.join(paths['optuser@1.0.0'], 'node_modules')
   assert.ok(fs.existsSync(path.join(optuserModules, 'optuser', 'package.json')))
   assert.ok(!fs.existsSync(path.join(optuserModules, 'optfail')))
+})
+
+test('overrides.nix can fix a build with arbitrary Nix', { skip: !hasNix }, async () => {
+  const { paths } = await materialize({ protocol: 1, nodes: { 'tool2@1.0.0': tool2Node } })
+  const out = path.join(paths['tool2@1.0.0'], 'node_modules', 'tool2', 'used-hello2.txt')
+  assert.match(fs.readFileSync(out, 'utf8'), /Hello/)
+})
+
+test('a failed nix-store add degrades to the local cache store with a warning', { skip: !hasNix }, async () => {
+  const request = { protocol: 1, impure: true, nodes: { 'net2@1.0.0': net2Node } }
+  const { paths } = await materialize(request, { nixStore: 'false' })
+  const cacheStore = path.join(process.env.PNPM_NIX_CACHE_DIR, 'store')
+  assert.ok(paths['net2@1.0.0'].startsWith(cacheStore), `expected ${paths['net2@1.0.0']} under ${cacheStore}`)
+  assert.equal(fs.readFileSync(path.join(paths['net2@1.0.0'], 'node_modules', 'net2', 'net.txt'), 'utf8'), 'pong')
+})
+
+test('impure mode materializes on the host when Nix is unavailable', { skip: !hasNix }, async () => {
+  const request = { protocol: 1, impure: true, nodes }
+  const noNix = { nixBuild: 'false', nixStore: 'false' }
+  const { paths } = await materialize(request, noNix)
+
+  const cacheStore = path.join(process.env.PNPM_NIX_CACHE_DIR, 'store')
+  for (const depPath of Object.keys(nodes)) {
+    assert.ok(paths[depPath].startsWith(cacheStore), `expected ${paths[depPath]} under ${cacheStore}`)
+  }
+  const pkgJson = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+  const aModules = path.join(paths['a@1.0.0'], 'node_modules')
+  assert.equal(pkgJson(path.join(aModules, 'c-alias')).name, 'c')
+  assert.equal(pkgJson(path.join(aModules, '@scope/d')).name, '@scope/d')
+  // the cycle members resolve each other through relative links
+  assert.equal(pkgJson(path.join(paths['b@1.0.0'], 'node_modules', 'c')).name, 'c')
+  // lifecycle scripts ran on the host, including a dependency's bin
+  assert.ok(fs.existsSync(path.join(paths['e@1.0.0'], 'node_modules', 'e', 'ran-f-cli.txt')))
+  // content-keyed cache: a second run without Nix reuses everything
+  const again = await materialize(request, noNix)
+  assert.deepEqual(again.paths, paths)
 })
 
 test('check reports non-reproducible builds with a diff excerpt', { skip: !hasNix }, async () => {

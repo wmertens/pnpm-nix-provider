@@ -9,6 +9,7 @@ import { GENERIC_NATIVE_RULE, looksNative, mergeRules } from './rules.js'
 const SRC_DIR = path.dirname(fileURLToPath(import.meta.url))
 const RUN_SCRIPTS = path.join(SRC_DIR, 'run-scripts.cjs')
 const SCRIPT_EVENTS = ['preinstall', 'install', 'postinstall']
+const NIX_STORE_PREFIX = '/nix/store/'
 
 /**
  * Group-by-group materialization, used whenever the single batch build is
@@ -21,9 +22,9 @@ const SCRIPT_EVENTS = ['preinstall', 'install', 'postinstall']
  * identical store paths to pure mode. Each remaining group then takes the
  * first rung that works, dependencies first:
  *
- * 1. A sandbox build with its build rules applied (plus the generic native
- *    recipe when the package looks like a native addon). Success means a
- *    real derivation output, shareable like any other.
+ * 1. A sandbox build with its build rules and user overrides applied (plus
+ *    the generic native recipe when the package looks like a native addon).
+ *    Success means a real derivation output, shareable like any other.
  * 2. With hostFallback (impure mode), assembly on the host: raw output
  *    copied, dependency symlinks pointed at the final paths, scripts run
  *    with the host's network and toolchain, and the result added
@@ -35,36 +36,47 @@ const SCRIPT_EVENTS = ['preinstall', 'install', 'postinstall']
  *    to it are scrubbed from dependents, and it is reported in the
  *    response's `skipped` list. Otherwise the install aborts.
  *
- * Host-added paths carry no reference metadata, but gc safety doesn't need
- * it: the final anchor pins every group to the exact path this run used, so
- * the single gc root protects the full set. A cache maps each group's pure
- * inputs (raw path, final dep paths, rules, engine) to its final path so
- * unchanged groups are reused across installs; forceRebuild bypasses it.
+ * Impure mode never fails because Nix could not store something — it
+ * degrades with a warning instead: a failed `nix-store --add` keeps the
+ * result in the local cache store, a failed gc-anchor build only loses gc
+ * protection, and if Nix cannot build at all (daemon down), packages are
+ * fetched, verified, unpacked, and built entirely on the host.
+ *
+ * A cache (outside the project by default; see cacheDir) maps each group's
+ * inputs (content identity, final dep paths, rules, overrides, engine) to
+ * its final path so unchanged groups are reused; forceRebuild bypasses it.
  */
 export async function materializeGranular (request, spec, opts, { hostFallback, forceRebuild = false }) {
   const nixStore = opts.nixStore ?? 'nix-store'
-  const nixOpts = { nixpkgs: request.nixpkgs, nixBuild: opts.nixBuild }
+  const nixOpts = { nixpkgs: request.nixpkgs, nixBuild: opts.nixBuild, overridesPath: opts.overridesPath }
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'pnpm-nix-granular-'))
   try {
     // The temp out-links keep intermediate results alive until the anchor is rooted.
-    const raw = await nixBuildManifest(spec, { mode: 'raw', outLink: path.join(tmp, 'raw-root'), ...nixOpts })
-
-    const scriptGroups = new Set()
-    for (const [groupKey, group] of Object.entries(spec.groups)) {
-      if (await analyzeGroup(groupKey, group, spec, raw)) scriptGroups.add(groupKey)
+    let raw = null
+    try {
+      raw = await nixBuildManifest(spec, { mode: 'raw', outLink: path.join(tmp, 'raw-root'), ...nixOpts })
+    } catch (err) {
+      if (!hostFallback) throw err
+      warn(`Nix cannot build right now (${message(err)}); materializing on the host`)
     }
 
-    // A group joins the plain pure batch when neither it nor anything below
-    // it runs scripts.
+    const scriptGroups = new Set()
     const pureGroups = new Set()
-    for (const groupKey of spec.groupOrder) {
-      const group = spec.groups[groupKey]
-      const depsPure = group.members.every((depPath) =>
-        Object.values(spec.nodes[depPath].deps ?? {}).every((dep) => {
-          const depGroup = spec.memberOf[dep.depPath]
-          return depGroup === groupKey || pureGroups.has(depGroup)
-        }))
-      if (depsPure && !scriptGroups.has(groupKey)) pureGroups.add(groupKey)
+    if (raw != null) {
+      for (const [groupKey, group] of Object.entries(spec.groups)) {
+        if (await analyzeGroup(groupKey, group, spec, raw)) scriptGroups.add(groupKey)
+      }
+      // A group joins the plain pure batch when neither it nor anything
+      // below it runs scripts.
+      for (const groupKey of spec.groupOrder) {
+        const group = spec.groups[groupKey]
+        const depsPure = group.members.every((depPath) =>
+          Object.values(spec.nodes[depPath].deps ?? {}).every((dep) => {
+            const depGroup = spec.memberOf[dep.depPath]
+            return depGroup === groupKey || pureGroups.has(depGroup)
+          }))
+        if (depsPure && !scriptGroups.has(groupKey)) pureGroups.add(groupKey)
+      }
     }
 
     const finalRoots = {}
@@ -88,24 +100,43 @@ export async function materializeGranular (request, spec, opts, { hostFallback, 
     for (const groupKey of spec.groupOrder) {
       if (pureGroups.has(groupKey) || skippedGroups.has(groupKey)) continue
       const group = spec.groups[groupKey]
-      const key = inputKey(groupKey, group, spec, raw, finalRoots)
-      let finalRoot = forceRebuild ? null : cache.entries[key]
-      if (finalRoot != null && (await isValidStorePath(nixStore, finalRoot))) {
-        if (!(await hasDeriver(nixStore, finalRoot))) pinned[groupKey] = finalRoot
+      // Local directory sources have no stable content identity without the
+      // raw derivation, so their host builds are not cached.
+      const cacheable = raw != null || group.members.every((depPath) => {
+        const node = spec.nodes[depPath]
+        return node.integrity != null || node.git?.commit != null
+      })
+      const key = inputKey(groupKey, group, spec, raw, finalRoots, opts.overridesHash)
+      let finalRoot = forceRebuild || !cacheable ? null : cache.entries[key]
+      if (finalRoot != null && (await rootIsValid(nixStore, finalRoot))) {
+        if (!finalRoot.startsWith(NIX_STORE_PREFIX) || !(await hasDeriver(nixStore, finalRoot))) {
+          pinned[groupKey] = finalRoot
+        }
         finalRoots[groupKey] = finalRoot
         continue
       }
       finalRoot = null
-      try {
-        finalRoot = await nixBuildGroup({ ...spec, pinned }, groupKey, {
-          outLink: path.join(tmp, `attempt-${attemptCount++}`),
-          ...nixOpts,
-        })
-      } catch {}
-      if (finalRoot == null && hostFallback) {
-        process.stderr.write(`pnpm-nix: sandbox build of ${groupKey} failed, building on the host\n`)
+      // The sandbox can only reference dependencies that live in the store.
+      const depsInStore = group.members.every((depPath) =>
+        Object.values(spec.nodes[depPath].deps ?? {}).every((dep) => {
+          const depGroup = spec.memberOf[dep.depPath]
+          return depGroup === groupKey || finalRoots[depGroup].startsWith(NIX_STORE_PREFIX)
+        }))
+      if (raw != null && depsInStore) {
         try {
-          finalRoot = await assembleOnHost(groupKey, group, spec, raw, finalRoots, tmp, nixStore)
+          finalRoot = await nixBuildGroup({ ...spec, pinned: storeOnly(pinned) }, groupKey, {
+            outLink: path.join(tmp, `attempt-${attemptCount++}`),
+            ...nixOpts,
+          })
+        } catch {}
+      }
+      if (finalRoot == null && hostFallback) {
+        if (raw != null) {
+          process.stderr.write(`pnpm-nix: sandbox build of ${groupKey} failed, building on the host\n`)
+        }
+        try {
+          const groupDir = await assembleOnHost(groupKey, group, spec, raw, finalRoots, tmp)
+          finalRoot = await storeGroupDir(groupDir, group, key, nixStore)
           pinned[groupKey] = finalRoot
         } catch {}
       }
@@ -118,22 +149,53 @@ export async function materializeGranular (request, spec, opts, { hostFallback, 
         }
         throw new Error(`building ${groupKey} failed`)
       }
-      cache.entries[key] = finalRoot
-      await saveCache(cache)
+      if (cacheable) {
+        cache.entries[key] = finalRoot
+        await saveCache(cache)
+      }
       finalRoots[groupKey] = finalRoot
     }
 
-    // Anchor: every group is pinned to the exact path this run used (host
-    // builds symlink into those), so the manifest mirrors finalRoots verbatim
-    // and the single gc root protects the full set, pure or added.
-    const outLink = (await gcRootLink(request.gcRootDir)) ?? path.join(tmp, 'anchor')
-    const paths = await nixBuildManifest({ ...spec, pinned: finalRoots }, { mode: 'full', outLink, ...nixOpts })
+    const paths = {}
+    for (const [depPath, groupKey] of Object.entries(spec.memberOf)) {
+      paths[depPath] = `${finalRoots[groupKey]}/${spec.subdir[depPath]}`
+    }
+
+    // Anchor: pins every store-resident group to the exact path this run
+    // used, so one gc root protects them (local-cache paths need none).
+    // Best effort — losing gc protection is a warning, not a failure.
+    try {
+      const storeRoots = storeOnly(finalRoots)
+      if (Object.keys(storeRoots).length > 0) {
+        const outLink = (await gcRootLink(request.gcRootDir)) ?? path.join(tmp, 'anchor')
+        await nixBuildManifest({ ...subsetSpec(spec, new Set(Object.keys(storeRoots))), pinned: storeRoots }, {
+          mode: 'full',
+          outLink,
+          ...nixOpts,
+        })
+      }
+    } catch (err) {
+      warn(`could not register the Nix gc root (${message(err)}); the store paths are unprotected until the next install`)
+    }
+
     const response = { protocol: PROTOCOL_VERSION, paths }
     if (skipped.length > 0) response.skipped = skipped
     return response
   } finally {
     await fs.rm(tmp, { recursive: true, force: true })
   }
+}
+
+function warn (text) {
+  process.stderr.write(`pnpm-nix: warning: ${text}\n`)
+}
+
+function message (err) {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function storeOnly (roots) {
+  return Object.fromEntries(Object.entries(roots).filter(([, dir]) => dir.startsWith(NIX_STORE_PREFIX)))
 }
 
 // Marks script groups and augments spec.rules with the generic native recipe
@@ -172,12 +234,12 @@ function scrubGroup (spec, groupKey, skipped) {
   }
 }
 
-// The pure subgraph is closed by construction, so the subset is a valid spec
-// and its groups produce derivations identical to a full-spec build.
-function subsetSpec (spec, pureGroups) {
+// The subset is a valid spec when its groups' dependencies are all included
+// or pinned; its groups produce derivations identical to a full-spec build.
+function subsetSpec (spec, includedGroups) {
   const subset = { nodes: {}, groups: {}, memberOf: {}, subdir: {}, groupOrder: [], rules: {} }
   for (const groupKey of spec.groupOrder) {
-    if (!pureGroups.has(groupKey)) continue
+    if (!includedGroups.has(groupKey)) continue
     subset.groupOrder.push(groupKey)
     subset.groups[groupKey] = spec.groups[groupKey]
     if (spec.rules[groupKey]) subset.rules[groupKey] = spec.rules[groupKey]
@@ -190,10 +252,10 @@ function subsetSpec (spec, pureGroups) {
   return subset
 }
 
-// The raw path covers tarball+patch content; final dep roots cover the
-// transitive build inputs; rules and engine cover the build environment.
-// Together they play the role a derivation hash plays for sandboxed builds.
-function inputKey (groupKey, group, spec, raw, finalRoots) {
+// Content identity (raw store path, or integrity/commit when Nix is down),
+// final dep roots, rules, overrides, and engine together play the role a
+// derivation hash plays for sandboxed builds.
+function inputKey (groupKey, group, spec, raw, finalRoots, overridesHash) {
   const depTargets = {}
   for (const depPath of group.members) {
     for (const [alias, dep] of Object.entries(spec.nodes[depPath].deps ?? {})) {
@@ -201,17 +263,33 @@ function inputKey (groupKey, group, spec, raw, finalRoots) {
       depTargets[`${depPath} ${alias}`] = depGroup === groupKey ? `intra:${dep.depPath}` : finalRoots[depGroup]
     }
   }
-  const rawDirs = group.members.map((depPath) => raw[depPath])
+  const sources = group.members.map((depPath) => {
+    if (raw != null) return raw[depPath]
+    const node = spec.nodes[depPath]
+    return node.integrity ?? (node.git?.commit != null ? `git:${node.git.commit}` : `dir:${node.directory}`)
+  })
   const engine = spec.nodes[groupKey].engine ?? ''
   const rule = spec.rules[groupKey] ?? null
-  return crypto.createHash('sha256').update(JSON.stringify({ v: 2, rawDirs, depTargets, engine, rule })).digest('hex')
+  const payload = { v: 3, sources, depTargets, engine, rule, overrides: overridesHash ?? null }
+  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex')
 }
 
-async function assembleOnHost (groupKey, group, spec, raw, finalRoots, tmp, nixStore) {
+/**
+ * Copies/creates the group members under a temp dir with dependency links
+ * and runs their lifecycle scripts on the host. When `raw` is null (Nix
+ * unavailable) the members are fetched, integrity-checked, and unpacked on
+ * the host too.
+ */
+async function assembleOnHost (groupKey, group, spec, raw, finalRoots, tmp) {
   const buildDir = await fs.mkdtemp(path.join(tmp, 'build-'))
   const groupDir = path.join(buildDir, `${group.drvName}-built`)
   for (const depPath of group.members) {
-    await fs.cp(raw[depPath], path.join(groupDir, spec.subdir[depPath]), { recursive: true })
+    const dest = path.join(groupDir, spec.subdir[depPath])
+    if (raw != null) {
+      await fs.cp(raw[depPath], dest, { recursive: true })
+    } else {
+      await hostRawMember(spec.nodes[depPath], dest, tmp)
+    }
   }
   await run('chmod', ['-R', 'u+w', groupDir], { captureStdout: false })
   for (const depPath of group.members) {
@@ -232,12 +310,74 @@ async function assembleOnHost (groupKey, group, spec, raw, finalRoots, tmp, nixS
     const pkgDir = path.join(groupDir, spec.subdir[depPath], 'node_modules', spec.nodes[depPath].name)
     await run(process.execPath, [RUN_SCRIPTS, pkgDir], { captureStdout: false })
   }
-  return (await run(nixStore, ['--add', groupDir])).trim()
+  return groupDir
 }
 
-async function isValidStorePath (nixStore, storePath) {
+// Host-side equivalent of a raw derivation: fetch/copy the source into
+// <dest>/node_modules/<name> and apply the patch.
+async function hostRawMember (node, dest, tmp) {
+  const pkgDir = path.join(dest, 'node_modules', node.name)
+  await fs.mkdir(pkgDir, { recursive: true })
+  if (node.directory != null) {
+    await fs.cp(node.directory, pkgDir, {
+      recursive: true,
+      filter: (src) => {
+        const base = path.basename(src)
+        return base !== 'node_modules' && base !== '.git'
+      },
+    })
+  } else if (node.git != null) {
+    const checkout = await fs.mkdtemp(path.join(tmp, 'git-'))
+    const repo = node.git.repo.replace(/^git\+/, '')
+    await run('git', ['clone', '--quiet', repo, checkout], { captureStdout: false })
+    await run('git', ['-C', checkout, 'checkout', '--quiet', node.git.commit], { captureStdout: false })
+    await fs.rm(path.join(checkout, '.git'), { recursive: true, force: true })
+    await fs.cp(checkout, pkgDir, { recursive: true })
+  } else {
+    const response = await fetch(node.tarball)
+    if (!response.ok) throw new Error(`downloading ${node.tarball} failed: HTTP ${response.status}`)
+    const buffer = Buffer.from(await response.arrayBuffer())
+    verifyIntegrity(buffer, node.integrity, node.tarball)
+    const tarball = path.join(await fs.mkdtemp(path.join(tmp, 'tgz-')), 'package.tgz')
+    await fs.writeFile(tarball, buffer)
+    await run('tar', ['-xzf', tarball, '--strip-components=1', '-C', pkgDir], { captureStdout: false })
+  }
+  if (node.patch != null) {
+    const patchFile = path.join(await fs.mkdtemp(path.join(tmp, 'patch-')), 'pnpm.patch')
+    await fs.writeFile(patchFile, node.patch.content)
+    await run('git', ['-C', pkgDir, 'apply', '--whitespace=nowarn', patchFile], { captureStdout: false })
+  }
+}
+
+function verifyIntegrity (buffer, integrity, url) {
+  const [algorithm, expected] = integrity.split('-', 2)
+  const actual = crypto.createHash(algorithm).update(buffer).digest('base64')
+  if (actual !== expected) {
+    throw new Error(`integrity mismatch for ${url}: expected ${integrity}, got ${algorithm}-${actual}`)
+  }
+}
+
+// `nix-store --add` the assembled group; when Nix cannot store it, keep it
+// in the local cache store with a warning instead of failing the install.
+async function storeGroupDir (groupDir, group, key, nixStore) {
   try {
-    await run(nixStore, ['--check-validity', storePath], { quiet: true })
+    return (await run(nixStore, ['--add', groupDir])).trim()
+  } catch (err) {
+    warn(`could not store ${group.drvName} in the Nix store (${message(err)}); keeping it in the local cache store`)
+    const dest = path.join(cacheDir(), 'store', key, path.basename(groupDir))
+    await fs.rm(path.dirname(dest), { recursive: true, force: true })
+    await fs.mkdir(path.dirname(dest), { recursive: true })
+    await fs.cp(groupDir, dest, { recursive: true, verbatimSymlinks: true })
+    return dest
+  }
+}
+
+async function rootIsValid (nixStore, root) {
+  if (!root.startsWith(NIX_STORE_PREFIX)) {
+    return fs.access(root).then(() => true, () => false)
+  }
+  try {
+    await run(nixStore, ['--check-validity', root], { quiet: true })
     return true
   } catch {
     return false
@@ -255,15 +395,15 @@ export async function hasDeriver (nixStore, storePath) {
   }
 }
 
-function cacheFile () {
-  const cacheHome = process.env.PNPM_NIX_CACHE_DIR ??
+/** Outside the project by default; PNPM_NIX_CACHE_DIR may point anywhere, including into a project. */
+function cacheDir () {
+  return process.env.PNPM_NIX_CACHE_DIR ??
     path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), '.cache'), 'pnpm-nix')
-  return path.join(cacheHome, 'impure-cache.json')
 }
 
 async function loadCache () {
   try {
-    const cache = JSON.parse(await fs.readFile(cacheFile(), 'utf8'))
+    const cache = JSON.parse(await fs.readFile(path.join(cacheDir(), 'impure-cache.json'), 'utf8'))
     if (cache.version === 1 && cache.entries != null) return cache
   } catch {}
   return { version: 1, entries: {} }
@@ -272,6 +412,6 @@ async function loadCache () {
 // TODO(TODO.md): no lock; concurrent installs race to last-writer-wins,
 // which only costs a redundant rebuild.
 async function saveCache (cache) {
-  await fs.mkdir(path.dirname(cacheFile()), { recursive: true })
-  await fs.writeFile(cacheFile(), JSON.stringify(cache))
+  await fs.mkdir(cacheDir(), { recursive: true })
+  await fs.writeFile(path.join(cacheDir(), 'impure-cache.json'), JSON.stringify(cache))
 }

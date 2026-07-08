@@ -5,6 +5,30 @@ import { fileURLToPath } from 'node:url'
 
 const BUILTIN_RULES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'rules.json')
 
+/** ~/.config fallback keeps the same location on macOS (home-manager writes there too). */
+export function userConfigDir () {
+  return path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'pnpm-nix')
+}
+
+/**
+ * A Nix-level escape hatch beyond declarative rules: a file evaluating to
+ * `{ pkgs, lib }: { "<name>" | "<name>@<version>" | "*" = drv: drv; }`,
+ * applied to every group derivation (e.g. via overrideAttrs). Resolved from
+ * PNPM_NIX_OVERRIDES, else ~/.config/pnpm-nix/overrides.nix.
+ */
+export async function resolveOverridesPath () {
+  const candidate = process.env.PNPM_NIX_OVERRIDES ?? path.join(userConfigDir(), 'overrides.nix')
+  try {
+    await fs.access(candidate)
+    return candidate
+  } catch {
+    if (process.env.PNPM_NIX_OVERRIDES) {
+      throw new Error(`PNPM_NIX_OVERRIDES points to an unreadable file: ${candidate}`)
+    }
+    return undefined
+  }
+}
+
 /**
  * Build rules describe what a package needs to build inside the sandbox:
  *   { "<name>" | "<name>@<version>": {
@@ -17,7 +41,7 @@ const BUILTIN_RULES = path.join(path.dirname(fileURLToPath(import.meta.url)), 'r
 export async function loadRules () {
   const sources = [
     BUILTIN_RULES,
-    path.join(process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), '.config'), 'pnpm-nix', 'rules.json'),
+    path.join(userConfigDir(), 'rules.json'),
     process.env.PNPM_NIX_RULES,
   ]
   const merged = {}

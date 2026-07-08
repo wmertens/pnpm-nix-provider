@@ -72,6 +72,34 @@ systems without channels.
 When running straight from a checkout of this repo instead, use the absolute
 path of `src/cli.js` (it must be executable, and `node` must be on PATH).
 
+### home-manager: set and forget
+
+The flake ships a home-manager module that installs the provider, points
+pnpm at it, and manages the rules/overrides files (all locations work on
+Linux and macOS):
+
+```nix
+{
+  inputs.pnpm-nix-provider.url = "github:wmertens/pnpm-nix-provider";
+
+  # in your home-manager configuration:
+  imports = [ inputs.pnpm-nix-provider.homeManagerModules.default ];
+  programs.pnpm-nix-provider = {
+    enable = true;   # install + write packageProvider to pnpm's config.yaml
+    impure = true;   # host-build what the sandbox can't, transparently
+    rules."better-sqlite3".extraInputs = [ "python3" ];  # optional
+    overrides = ''
+      { pkgs, lib }: { }
+    '';              # optional, arbitrary Nix per package
+  };
+}
+```
+
+Set `configurePnpm = false` if you manage pnpm's global config yourself
+(home-manager owning `pnpm/config.yaml` means `pnpm config set -g` can no
+longer edit it) and run
+`pnpm config set -g package-provider pnpm-nix-provider` once instead.
+
 ## Protocol (version 1)
 
 The provider is an executable. pnpm writes one JSON request to stdin, the
@@ -166,9 +194,30 @@ changing a rule rebuilds the package. Sources merge in order: built-in
 
 Packages that look like native addons (a `binding.gyp`, or scripts invoking
 node-gyp/node-pre-gyp/prebuild-install) additionally get a **generic native
-recipe** in impure mode: python3 on PATH, `npm_config_nodedir` pointing at
-the nixpkgs Node (so headers aren't downloaded), and npm's bundled node-gyp
-exposed on PATH.
+recipe** in impure mode: python3 and a C/C++ toolchain on PATH,
+`npm_config_nodedir` pointing at the nixpkgs Node (so headers aren't
+downloaded), and npm's bundled node-gyp exposed on PATH.
+
+### Nix overrides
+
+When declarative rules aren't enough, `~/.config/pnpm-nix/overrides.nix`
+(or a file named by `PNPM_NIX_OVERRIDES`) can rewrite any build with
+arbitrary Nix:
+
+```nix
+{ pkgs, lib }: {
+  # keys are "<name>", "<name>@<version>", or "*"
+  "sharp" = drv: drv.overrideAttrs (prev: {
+    nativeBuildInputs = prev.nativeBuildInputs ++ [ pkgs.vips pkgs.pkg-config ];
+  });
+}
+```
+
+Each value is a function from the group derivation to a new derivation.
+Overrides participate in the input hash, so editing the file rebuilds the
+packages it affects. `PNPM_NIX_NIXPKGS` pins the nixpkgs used for
+evaluation (default `<nixpkgs>`; the flake-built binary falls back to its
+own pinned input).
 
 In pure mode, a failed batch build is retried group by group with rules and
 the generic native recipe applied, and failing **optional** dependencies are
@@ -194,11 +243,19 @@ Each package takes the first rung that works:
    groups are *pinned*: packages above them still build purely in the
    sandbox, referencing them via `builtins.storePath`.
 
-A cache under `${XDG_CACHE_HOME:-~/.cache}/pnpm-nix/` maps each group's pure
-inputs (raw unpack path, final dependency paths, rules, engine key) to its
-final path, so unchanged packages are reused across installs. GC safety is
-unchanged: the anchor references every final path verbatim, so the single gc
-root protects the full mixed set.
+Impure mode is transparent by design: it never fails an install because Nix
+could not store something. A failed `nix-store --add` keeps the built
+package in the local cache store with a warning; a failed gc-anchor build
+only costs gc protection until the next install; and when Nix cannot build
+at all (daemon down or absent), packages are fetched, integrity-checked,
+unpacked, and built entirely on the host.
+
+The cache — the input→path mapping and the local fallback store — lives
+under `${XDG_CACHE_HOME:-~/.cache}/pnpm-nix/`, never inside the project.
+Set `PNPM_NIX_CACHE_DIR` to relocate it, including into a project if a
+per-project cache is what you want. GC safety is unchanged: the anchor
+references every store-resident path verbatim, so the single gc root
+protects them (local-cache paths need no gc protection).
 
 Host-built paths are machine-specific — don't push them to a binary cache.
 

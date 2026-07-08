@@ -6,7 +6,9 @@
 #            their paths are imported with builtins.storePath instead of built
 # mode "full" assembles complete packages (dep links + lifecycle scripts);
 # mode "raw" stops after unpack+patch (used by the impure host-build path).
-{ depsJsonPath, nixpkgs ? <nixpkgs>, mode ? "full" }:
+# overridesPath names a user file `{ pkgs, lib }: { "<name>" = drv: drv; }`
+# whose functions are applied to the assembled group derivations.
+{ depsJsonPath, nixpkgs ? <nixpkgs>, mode ? "full", overridesPath ? null }:
 let
   assemble = mode == "full";
   pkgs = import nixpkgs { config = { }; overlays = [ ]; };
@@ -48,7 +50,21 @@ let
     (_: value: if builtins.isAttrs value then "${resolveInput value.drv}" else value)
     (rule.env or { });
 
-  groupDrvs = lib.mapAttrs mkGroup groups;
+  overrides =
+    if overridesPath == null
+    then { }
+    else import (/. + overridesPath) { inherit pkgs lib; };
+
+  # Overrides only touch assembled builds; raw unpack derivations stay
+  # stable so the impure host path shares them regardless of overrides.
+  # For cycle groups the lookup uses the group's first member.
+  applyOverride = groupKey: drv:
+    let
+      node = nodes.${groupKey};
+      override = overrides."${node.name}@${node.version}" or (overrides.${node.name} or (overrides."*" or null));
+    in if assemble && override != null then override drv else drv;
+
+  groupDrvs = lib.mapAttrs (groupKey: group: applyOverride groupKey (mkGroup groupKey group)) groups;
 
   rootOf = groupKey:
     if pinned ? ${groupKey}

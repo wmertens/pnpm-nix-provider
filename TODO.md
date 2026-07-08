@@ -44,3 +44,5 @@ in the source point here.
 ## Ecosystem (later)
 
 - Publish and curate a shared build-rules registry.
+- The home-manager module has no automated test; exercise it in a real
+  home-manager evaluation (Linux + macOS) once there's a consumer.

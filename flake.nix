@@ -37,5 +37,59 @@
         };
         default = pnpm-nix-provider;
       });
+
+      homeManagerModules = rec {
+        pnpm-nix-provider = { config, lib, pkgs, ... }:
+          let cfg = config.programs.pnpm-nix-provider;
+          in {
+            options.programs.pnpm-nix-provider = {
+              enable = lib.mkEnableOption "the pnpm Nix package provider";
+              configurePnpm = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = ''
+                  Write `packageProvider: pnpm-nix-provider` to pnpm's global
+                  config.yaml so every install uses the provider. Disable this
+                  if you manage pnpm's global config yourself (e.g. with
+                  `pnpm config set -g`) — pnpm cannot edit the file while
+                  home-manager owns it.
+                '';
+              };
+              rules = lib.mkOption {
+                type = lib.types.attrs;
+                default = { };
+                example = { better-sqlite3.extraInputs = [ "python3" ]; };
+                description = "Build rules, written to pnpm-nix/rules.json.";
+              };
+              overrides = lib.mkOption {
+                type = lib.types.nullOr lib.types.lines;
+                default = null;
+                example = ''
+                  { pkgs, lib }: {
+                    "sharp" = drv: drv.overrideAttrs (prev: {
+                      nativeBuildInputs = prev.nativeBuildInputs ++ [ pkgs.vips ];
+                    });
+                  }
+                '';
+                description = "Nix build overrides, written to pnpm-nix/overrides.nix.";
+              };
+              impure = lib.mkOption {
+                type = lib.types.bool;
+                default = false;
+                description = "Allow host builds as a last resort (PNPM_NIX_IMPURE=1).";
+              };
+            };
+            config = lib.mkIf cfg.enable {
+              home.packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+              home.sessionVariables = lib.mkIf cfg.impure { PNPM_NIX_IMPURE = "1"; };
+              xdg.configFile = {
+                "pnpm-nix/rules.json" = lib.mkIf (cfg.rules != { }) { text = builtins.toJSON cfg.rules; };
+                "pnpm-nix/overrides.nix" = lib.mkIf (cfg.overrides != null) { text = cfg.overrides; };
+                "pnpm/config.yaml" = lib.mkIf cfg.configurePnpm { text = "packageProvider: pnpm-nix-provider\n"; };
+              };
+            };
+          };
+        default = pnpm-nix-provider;
+      };
     };
 }
