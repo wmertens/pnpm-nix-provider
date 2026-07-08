@@ -42,19 +42,32 @@ enters the shell has it:
 }
 ```
 
-Then point pnpm at it (a bare name is resolved on PATH; an absolute path
-also works):
+Then tell pnpm to use it. Most projects won't want to commit this setting —
+whether dependencies come from the Nix store is a per-machine choice, and
+collaborators without Nix should still be able to install. So set it in your
+**user-level pnpm config**:
+
+```sh
+pnpm config set -g package-provider pnpm-nix-provider
+```
+
+which writes `packageProvider: pnpm-nix-provider` to
+`~/.config/pnpm/config.yaml`. Every pnpm install on this machine now
+materializes dependencies in the Nix store, in any project.
+
+Projects that *do* want to commit the choice (an all-Nix team) put the same
+setting in the repo instead:
 
 ```yaml
 # pnpm-workspace.yaml
 packageProvider: pnpm-nix-provider
 ```
 
-That's it — `pnpm install` now materializes every dependency in the Nix
-store. The provider needs a pnpm with the `package-provider` setting, and
-`nix-build` on PATH. `<nixpkgs>` is taken from `NIX_PATH` when set; the
-flake-built binary falls back to the flake's pinned nixpkgs, so it works on
-flakes-only systems without channels.
+Either way the value is resolved on PATH (an absolute path also works). The
+provider needs a pnpm with the `package-provider` setting, and `nix-build`
+on PATH. `<nixpkgs>` is taken from `NIX_PATH` when set; the flake-built
+binary falls back to the flake's pinned nixpkgs, so it works on flakes-only
+systems without channels.
 
 When running straight from a checkout of this repo instead, use the absolute
 path of `src/cli.js` (it must be executable, and `node` must be on PATH).
