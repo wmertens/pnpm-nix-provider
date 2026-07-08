@@ -38,6 +38,98 @@
         default = pnpm-nix-provider;
       });
 
+      # The module test evaluates it against stubs of the home-manager
+      # options it writes to (home.packages, home.sessionVariables,
+      # xdg.configFile.<name>.text). The module only relies on core module
+      # system semantics, so the stubs are faithful; a real home-manager
+      # input stays out of the flake so consumers don't have to lock it.
+      checks = eachSystem (system: pkgs:
+        let
+          lib = nixpkgs.lib;
+          stubHomeManagerOptions = {
+            options = {
+              home.packages = lib.mkOption {
+                type = lib.types.listOf lib.types.package;
+                default = [ ];
+              };
+              home.sessionVariables = lib.mkOption {
+                type = lib.types.attrsOf lib.types.str;
+                default = { };
+              };
+              xdg.configFile = lib.mkOption {
+                type = lib.types.attrsOf (lib.types.submodule {
+                  options.text = lib.mkOption {
+                    type = lib.types.nullOr lib.types.lines;
+                    default = null;
+                  };
+                });
+                default = { };
+              };
+            };
+          };
+          evalWith = settings: (lib.evalModules {
+            modules = [
+              stubHomeManagerOptions
+              self.homeManagerModules.default
+              { _module.args.pkgs = pkgs; }
+              { programs.pnpm-nix-provider = settings; }
+            ];
+          }).config;
+          enabled = evalWith {
+            enable = true;
+            impure = true;
+            rules.foo.extraInputs = [ "hello" ];
+            overrides = "{ pkgs, lib }: { }";
+          };
+          defaults = evalWith { enable = true; };
+          selfManaged = evalWith { enable = true; configurePnpm = false; };
+          disabled = evalWith { };
+          asserts = [
+            {
+              ok = enabled.xdg.configFile."pnpm/config.yaml".text == "packageProvider: pnpm-nix-provider\n";
+              msg = "enable should point pnpm at the provider";
+            }
+            {
+              ok = enabled.xdg.configFile."pnpm-nix/rules.json".text == builtins.toJSON { foo.extraInputs = [ "hello" ]; };
+              msg = "rules should serialize to rules.json";
+            }
+            {
+              ok = enabled.xdg.configFile."pnpm-nix/overrides.nix".text == "{ pkgs, lib }: { }";
+              msg = "overrides should be written verbatim";
+            }
+            {
+              ok = enabled.home.sessionVariables.PNPM_NIX_IMPURE or null == "1";
+              msg = "impure should export PNPM_NIX_IMPURE=1";
+            }
+            {
+              ok = lib.any (p: lib.getName p == "pnpm-nix-provider") enabled.home.packages;
+              msg = "enable should install the provider package";
+            }
+            {
+              ok = !(defaults.xdg.configFile ? "pnpm-nix/rules.json") && !(defaults.xdg.configFile ? "pnpm-nix/overrides.nix");
+              msg = "empty rules/overrides should write no files";
+            }
+            {
+              ok = !(defaults.home.sessionVariables ? PNPM_NIX_IMPURE);
+              msg = "impure should default off";
+            }
+            {
+              ok = !(selfManaged.xdg.configFile ? "pnpm/config.yaml");
+              msg = "configurePnpm = false should leave pnpm's config alone";
+            }
+            {
+              ok = disabled.home.packages == [ ] && disabled.xdg.configFile == { };
+              msg = "the module should be inert when disabled";
+            }
+          ];
+          failures = builtins.filter (a: !a.ok) asserts;
+        in {
+          home-manager-module =
+            if failures == [ ]
+            then pkgs.runCommand "home-manager-module-test" { } "touch $out"
+            else throw "home-manager module test failed: ${lib.concatMapStringsSep "; " (a: a.msg) failures}";
+        });
+
       homeManagerModules = rec {
         pnpm-nix-provider = { config, lib, pkgs, ... }:
           let cfg = config.programs.pnpm-nix-provider;
