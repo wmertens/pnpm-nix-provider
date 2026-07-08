@@ -1,4 +1,4 @@
-# @pnpm/nix-provider
+# pnpm-nix-provider
 
 An external package provider for pnpm that materializes npm packages as Nix
 store paths. pnpm sends it the resolved dependency graph; the provider builds
@@ -9,18 +9,55 @@ resulting store paths, and pnpm symlinks `node_modules` straight into
 Packages are input-addressed: the same lockfile deterministically reaches the
 same store paths, unchanged subtrees stay cached across updates, and store
 paths can be shared through Nix binary caches. A single indirect gc root per
-project protects the whole closure.
+project protects the whole closure. Both pnpm CLIs (the TypeScript one and
+pacquet) speak the provider protocol and produce identical store paths from
+the same lockfile.
 
 ## Usage
 
-```yaml
-# pnpm-workspace.yaml
-packageProvider: /path/to/pnpm-nix-provider
+Get the provider onto your PATH — the easiest way is this repo's flake.
+Either install it into your profile:
+
+```sh
+nix profile install github:wmertens/pnpm-nix-provider
 ```
 
-Requires `nix-build` on PATH and a resolvable `<nixpkgs>` (override per
-request, see below). When pointing straight at a checkout of this repo, use
-the absolute path of `src/cli.js` (it must be executable).
+or, nicer for a team, add it to the project's dev shell so everyone who
+enters the shell has it:
+
+```nix
+# flake.nix of your project
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  inputs.pnpm-nix-provider.url = "github:wmertens/pnpm-nix-provider";
+
+  outputs = { nixpkgs, pnpm-nix-provider, ... }:
+    let system = "x86_64-linux"; # or your system
+        pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [ pnpm-nix-provider.packages.${system}.default ];
+      };
+    };
+}
+```
+
+Then point pnpm at it (a bare name is resolved on PATH; an absolute path
+also works):
+
+```yaml
+# pnpm-workspace.yaml
+packageProvider: pnpm-nix-provider
+```
+
+That's it — `pnpm install` now materializes every dependency in the Nix
+store. The provider needs a pnpm with the `package-provider` setting, and
+`nix-build` on PATH. `<nixpkgs>` is taken from `NIX_PATH` when set; the
+flake-built binary falls back to the flake's pinned nixpkgs, so it works on
+flakes-only systems without channels.
+
+When running straight from a checkout of this repo instead, use the absolute
+path of `src/cli.js` (it must be executable, and `node` must be on PATH).
 
 ## Protocol (version 1)
 

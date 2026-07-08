@@ -1,7 +1,8 @@
 {
-  "name": "@pnpm/nix-provider",
+  "name": "pnpm-nix-provider",
   "version": "0.1.0",
   "description": "pnpm external package provider that materializes packages as Nix store paths",
+  "repository": "github:wmertens/pnpm-nix-provider",
   "license": "MIT",
   "type": "module",
   "bin": {
