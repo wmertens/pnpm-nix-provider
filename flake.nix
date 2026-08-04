@@ -9,6 +9,30 @@
       eachSystem = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in {
       packages = eachSystem (system: pkgs: rec {
+        # pnpm with `packageProvider` support, prebuilt from the
+        # package-provider branch of wmertens/pnpm (see the release notes for
+        # the exact commit). Platform-independent JS bundle, wrapped with node.
+        pnpm = pkgs.stdenvNoCC.mkDerivation {
+          pname = "pnpm";
+          version = "11.10.0-pp.1";
+          src = pkgs.fetchurl {
+            url = "https://github.com/wmertens/pnpm-nix-provider/releases/download/pnpm-v11.10.0-pp.1/pnpm-11.10.0-pp.1.tgz";
+            hash = "sha256-4bKU7NEK/JPxE3ZsyXrQK+KZYkfdiWdvhgcq9HqKgWA=";
+          };
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          dontBuild = true;
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out/lib/pnpm
+            cp -r . $out/lib/pnpm/
+            makeWrapper ${pkgs.nodejs}/bin/node $out/bin/pnpm \
+              --add-flags $out/lib/pnpm/bin/pnpm.mjs
+            makeWrapper ${pkgs.nodejs}/bin/node $out/bin/pnpx \
+              --add-flags $out/lib/pnpm/bin/pnpx.mjs
+            runHook postInstall
+          '';
+        };
+
         pnpm-nix-provider = pkgs.stdenvNoCC.mkDerivation {
           pname = "pnpm-nix-provider";
           version = "0.1.0";
@@ -83,6 +107,7 @@
           };
           defaults = evalWith { enable = true; };
           selfManaged = evalWith { enable = true; configurePnpm = false; };
+          noPnpm = evalWith { enable = true; installPnpm = false; };
           disabled = evalWith { };
           asserts = [
             {
@@ -104,6 +129,14 @@
             {
               ok = lib.any (p: lib.getName p == "pnpm-nix-provider") enabled.home.packages;
               msg = "enable should install the provider package";
+            }
+            {
+              ok = lib.any (p: lib.getName p == "pnpm") enabled.home.packages;
+              msg = "enable should install the patched pnpm by default";
+            }
+            {
+              ok = !(lib.any (p: lib.getName p == "pnpm") noPnpm.home.packages);
+              msg = "installPnpm = false should leave pnpm alone";
             }
             {
               ok = !(defaults.xdg.configFile ? "pnpm-nix/rules.json") && !(defaults.xdg.configFile ? "pnpm-nix/overrides.nix");
@@ -136,6 +169,15 @@
           in {
             options.programs.pnpm-nix-provider = {
               enable = lib.mkEnableOption "the pnpm Nix package provider";
+              installPnpm = lib.mkOption {
+                type = lib.types.bool;
+                default = true;
+                description = ''
+                  Install the provider-aware pnpm build (released pnpm does
+                  not know the `packageProvider` setting yet). Disable if you
+                  bring your own pnpm build.
+                '';
+              };
               configurePnpm = lib.mkOption {
                 type = lib.types.bool;
                 default = true;
@@ -172,7 +214,8 @@
               };
             };
             config = lib.mkIf cfg.enable {
-              home.packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+              home.packages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ]
+                ++ lib.optional cfg.installPnpm self.packages.${pkgs.stdenv.hostPlatform.system}.pnpm;
               home.sessionVariables = lib.mkIf cfg.impure { PNPM_NIX_IMPURE = "1"; };
               xdg.configFile = {
                 "pnpm-nix/rules.json" = lib.mkIf (cfg.rules != { }) { text = builtins.toJSON cfg.rules; };

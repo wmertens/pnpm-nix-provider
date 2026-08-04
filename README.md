@@ -15,11 +15,19 @@ the same lockfile.
 
 ## Usage
 
-Get the provider onto your PATH — the easiest way is this repo's flake.
-Either install it into your profile:
+You need two things: the provider on your PATH, and a pnpm that knows the
+`packageProvider` setting. Released pnpm doesn't yet — the feature lives on
+the [`package-provider` branch of wmertens/pnpm](https://github.com/wmertens/pnpm/tree/package-provider) —
+so this flake also ships a prebuilt provider-aware pnpm as `packages.pnpm`
+(the bundle is attached to this repo's GitHub releases; the release notes
+name the exact commit it was built from).
+
+The easiest way to get both is this repo's flake. Either install into your
+profile:
 
 ```sh
-nix profile install github:wmertens/pnpm-nix-provider
+nix profile install github:wmertens/pnpm-nix-provider  # the provider
+nix profile install github:wmertens/pnpm-nix-provider#pnpm  # patched pnpm
 ```
 
 or, nicer for a team, add it to the project's dev shell so everyone who
@@ -36,7 +44,10 @@ enters the shell has it:
         pkgs = nixpkgs.legacyPackages.${system};
     in {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ pnpm-nix-provider.packages.${system}.default ];
+        packages = [
+          pnpm-nix-provider.packages.${system}.default # the provider
+          pnpm-nix-provider.packages.${system}.pnpm # provider-aware pnpm
+        ];
       };
     };
 }
@@ -74,9 +85,9 @@ path of `src/cli.js` (it must be executable, and `node` must be on PATH).
 
 ### home-manager: set and forget
 
-The flake ships a home-manager module that installs the provider, points
-pnpm at it, and manages the rules/overrides files (all locations work on
-Linux and macOS):
+The flake ships a home-manager module that installs the provider and the
+provider-aware pnpm, points pnpm at the provider, and manages the
+rules/overrides files (all locations work on Linux and macOS):
 
 ```nix
 {
@@ -99,6 +110,13 @@ Set `configurePnpm = false` if you manage pnpm's global config yourself
 (home-manager owning `pnpm/config.yaml` means `pnpm config set -g` can no
 longer edit it) and run
 `pnpm config set -g package-provider pnpm-nix-provider` once instead.
+Set `installPnpm = false` if you bring your own provider-aware pnpm build.
+
+One caveat: in a project that pins `packageManager: pnpm@<version>` in its
+package.json, pnpm downloads and defers to that stock version, which ignores
+`packageProvider` (with a warning). To try the provider in such a project,
+add `pmOnFail: warn` to its `pnpm-workspace.yaml` (or remove the pin) so the
+provider-aware pnpm keeps running.
 
 ## Protocol (version 1)
 
