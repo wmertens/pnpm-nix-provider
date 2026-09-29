@@ -345,7 +345,7 @@ async function hostRawMember (node, dest, tmp) {
   if (node.patch != null) {
     const patchFile = path.join(await fs.mkdtemp(path.join(tmp, 'patch-')), 'pnpm.patch')
     await fs.writeFile(patchFile, node.patch.content)
-    await run('git', ['-C', pkgDir, 'apply', '--whitespace=nowarn', patchFile], { captureStdout: false })
+    await run('git', ['-C', pkgDir, 'apply', '--ignore-whitespace', '--whitespace=nowarn', patchFile], { captureStdout: false })
   }
 }
 

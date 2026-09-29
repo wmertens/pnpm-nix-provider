@@ -92,7 +92,7 @@ let
       ${unpack}
       chmod -R u+w "${dir}"
       ${lib.optionalString (node ? patch) ''
-        ${pkgs.gitMinimal}/bin/git -C "${dir}" apply --whitespace=nowarn ${pkgs.writeText "pnpm-patch" node.patch.content}
+        ${pkgs.gitMinimal}/bin/git -C "${dir}" apply --ignore-whitespace --whitespace=nowarn ${pkgs.writeText "pnpm-patch" node.patch.content}
       ''}
       jq -r '.bin // empty | if type == "string" then [.] else [.[]] end | .[]' "${dir}/package.json" \
         | while IFS= read -r binFile; do chmod +x "${dir}/$binFile" || true; done
