@@ -14,10 +14,10 @@
         # the exact commit). Platform-independent JS bundle, wrapped with node.
         pnpm = pkgs.stdenvNoCC.mkDerivation {
           pname = "pnpm";
-          version = "11.21.0-pp.1";
+          version = "11.28.2-pp.1";
           src = pkgs.fetchurl {
-            url = "https://github.com/wmertens/pnpm-nix-provider/releases/download/pnpm-v11.21.0-pp.1/pnpm-11.21.0-pp.1.tgz";
-            hash = "sha256-ZQ9bwANdmuvOB9Ew7FHxAsY+eW9E0AO8YYHmZ03EeLo=";
+            url = "https://github.com/wmertens/pnpm-nix-provider/releases/download/pnpm-v11.28.2-pp.1/pnpm-11.28.2-pp.1.tgz";
+            hash = "sha256-WuLXsODh4jfqNICWRpORZMh2MUhtiTzn/AVXil5zg/g=";
           };
           nativeBuildInputs = [ pkgs.makeWrapper ];
           dontBuild = true;
